@@ -26,6 +26,7 @@ SRC_URI = "http://wiki.qemu-project.org/download/qemu-${PV}.tar.bz2 \
             file://audio-policy.patch;patch=1 \
             file://fix-surfman-coherency.patch;patch=1 \
             file://change-default-pixelformat.patch;patch=1 \
+            file://msix-cap-disable.patch;patch=1 \
             "
 
 SRC_URI[md5sum] = "78f13b774814b6b7ebcaf4f9b9204318"
