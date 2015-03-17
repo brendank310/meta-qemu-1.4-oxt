@@ -1,4 +1,4 @@
-From 222d0572d091c5a8ae885cef08a637f5b970e1e0 Mon Sep 17 00:00:00 2001
+From 288fb427282ecf575d4c60189225c35cf810a627 Mon Sep 17 00:00:00 2001
 From: Brendan Kerrigan <kerriganb@ainfosec.com>
 Date: Tue, 17 Mar 2015 12:03:58 -0400
 Subject: [PATCH] Enable changing of ISO media in non-stubdom device model
@@ -85,7 +85,7 @@ index f25d242..3e69183 100644
          autostart = 0;
      return dinfo;
 diff --git a/hw/xen_backend.c b/hw/xen_backend.c
-index a8af20f..256b30a 100644
+index a8af20f..79f3073 100644
 --- a/hw/xen_backend.c
 +++ b/hw/xen_backend.c
 @@ -33,16 +33,20 @@
@@ -145,7 +145,7 @@ index a8af20f..256b30a 100644
 +
 +    // Don't try to do the change if node->iso_file doesn't exist
 +    if (access(node->iso_file, F_OK) != -1) {
-+        qmp_change_blockdev(bdrv_get_device_name(node->drive->bdrv), node->iso_fil e, false, NULL, &err);
++        qmp_change_blockdev(bdrv_get_device_name(node->drive->bdrv), node->iso_file, false, NULL, &err);
 +    }
 +
 +    if (err) {
@@ -170,9 +170,9 @@ index a8af20f..256b30a 100644
 +        // fired watch is matched with the drive of interest.
 +        if (node && node->drive && node->iso_file &&
 +            node->xen_vbd_id && node->frontend_state &&
-+            strstr(watch, nod  e->xen_vbd_id) && !node->first_watch) {
++            strstr(watch, node->xen_vbd_id) && !node->first_watch) {
 +
-+            newFile = xs_read(xenst    ore, XBT_NULL, watch, &fileLen);
++            newFile = xs_read(xenstore, XBT_NULL, watch, &fileLen);
 +            
 +            // Switch out the file path to  the iso, so change gets made
 +            // when the node->timer fires.
@@ -199,9 +199,9 @@ index a8af20f..256b30a 100644
  static void xenstore_update(void *unused)
  {
      char **vec = NULL;
-@@ -813,6 +893,11 @@ bool xenstore_add_watch(const char *path, xenstore_watch_cb_t cb,
-             return false;
-         }
+@@ -665,6 +745,11 @@ static void xenstore_update(void *unused)
+                &ptr, &ops) == 2) {
+         ((xenstore_watch_cb_t)ptr)((void *)ops);
      }
 +    /* OpenXT:
 +     * Notify the emulator of a change in media */
@@ -209,8 +209,8 @@ index a8af20f..256b30a 100644
 +      xenstore_update_iso(vec[XS_WATCH_PATH]);
 +    }
  
-     /* xs_watch copies this token and xenstore_update() parses it on event */
-     snprintf(token, sizeof(token), "cb:%p:%p", cb, opaque);
+ cleanup:
+     free(vec);
 @@ -874,3 +959,150 @@ bool xenstore_is_legacy_res_only(void)
      return !!val;
  }

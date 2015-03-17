@@ -149,7 +149,7 @@ index a8af20f..de9b8b5 100644
 +    
 +    // Don't try to do  the change if node->iso_file doesn't exist
 +    if (access(node->iso_file, F_OK) != -1) {
-+        qmp_change_blockdev(bdrv_get_device_name(node->drive->bdrv), node->iso_file, fal   se, NULL, &err);
++        qmp_change_blockdev(bdrv_get_device_name(node->drive->bdrv), node->iso_file, false, NULL, &err);
 +    }
 +    
 +    if (err) {
@@ -176,7 +176,7 @@ index a8af20f..de9b8b5 100644
 +        // fired watch is matched with t   he drive of interest.
 +        if (node && node->drive && node->iso_file
 +            && node->xen_vbd_id && node->frontend_state 
-+            && strstr(watch, nod  e->xen_vbd_id) && !first_watch) {
++            && strstr(watch, node->xen_vbd_id) && !first_watch) {
 +
 +            // Retrieve the backend state for this particular blkfront
 +            // drive
