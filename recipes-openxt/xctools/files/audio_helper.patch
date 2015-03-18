@@ -1,0 +1,2797 @@
+diff -Naur xctools/audio_helper/configure.in xctools-audio-helper/audio_helper/configure.in
+--- xctools/audio_helper/configure.in   2015-02-20 10:30:32.269561814 -0500
++++ xctools-audio-helper/audio_helper/configure.in  2015-03-12 09:50:02.283241997 -0400
+@@ -13,7 +13,7 @@
+ dnl
+ dnl
+ AC_PREREQ(2.13)
+-AC_INIT(src/audio_helper.c)
++AC_INIT(src/openxtaudio.c)
+ 
+ AC_PROG_CC
+ AC_PROG_CPP
+diff -Naur xctools/audio_helper/src/audio_helper.c xctools-audio-helper/audio_helper/src/audio_helper.c
+--- xctools/audio_helper/src/audio_helper.c 2015-02-20 10:30:32.269561814 -0500
++++ xctools-audio-helper/audio_helper/src/audio_helper.c    1969-12-31 19:00:00.000000000 -0500
+@@ -1,1058 +0,0 @@
+-/*
+- * audio_helper.c:
+- *
+- *
+- */
+-
+-/*
+- * Copyright (c) 2013 Citrix Systems, Inc.
+- * 
+- * This program is free software; you can redistribute it and/or modify
+- * it under the terms of the GNU General Public License as published by
+- * the Free Software Foundation; either version 2 of the License, or
+- * (at your option) any later version.
+- * 
+- * This program is distributed in the hope that it will be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+- * GNU General Public License for more details.
+- * 
+- * You should have received a copy of the GNU General Public License
+- * along with this program; if not, write to the Free Software
+- * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+- */
+-
+-
+-#include "project.h"
+-#include <libv4v.h>
+-
+-#include <unistd.h>
+-#include <sys/types.h>
+-#include <sys/ioctl.h>
+-#include <sys/socket.h>
+-#include <sys/mman.h>
+-#include <sys/stat.h>
+-#include <fcntl.h>
+-#include <alsa/asoundlib.h>
+-
+-typedef enum {
+-    AUD_FMT_U8,
+-    AUD_FMT_S8,
+-    AUD_FMT_U16,
+-    AUD_FMT_S16,
+-    AUD_FMT_U32,
+-    AUD_FMT_S32
+-} audfmt_e;
+-
+-static struct {
+-    int size_in_usec_in;
+-    int size_in_usec_out;
+-    const char *pcm_name_in;
+-    const char *pcm_name_out;
+-    unsigned int buffer_size_in;
+-    unsigned int period_size_in;
+-    unsigned int buffer_size_out;
+-    unsigned int period_size_out;
+-    unsigned int threshold;
+-
+-    int buffer_size_in_overridden;
+-    int period_size_in_overridden;
+-
+-    int buffer_size_out_overridden;
+-    int period_size_out_overridden;
+-    int verbose;
+-
+-    const char *volume_control;
+-} conf = {
+-    .buffer_size_out = 1024,
+-    .pcm_name_out = "default",
+-    .pcm_name_in = "default",
+-    .volume_control = "Master",
+-};
+-
+-char pcm_name_in[256];
+-char pcm_name_out[256];
+-char volume_control[256];
+-
+-struct alsa_params_req {
+-    int freq;
+-    snd_pcm_format_t fmt;
+-    int nchannels;
+-    int size_in_usec;
+-    int override_mask;
+-    unsigned int buffer_size;
+-    unsigned int period_size;
+-};
+-
+-struct alsa_params_obt {
+-    int freq;
+-    audfmt_e fmt;
+-    int endianness;
+-    int nchannels;
+-    snd_pcm_uframes_t samples;
+-};
+-
+-#define AUDIO_DEBUG
+-
+-#ifdef AUDIO_DEBUG
+-# define AH_LOG(Args...) printf(Args)
+-# define AH_HEX_DUMP(buf, len) ah_hex_dump(buf, len)
+-#else
+-# define AH_LOG(Args...)
+-# define AH_HEX_DUMP(buf, len)
+-#endif
+-
+-#define V4V_TYPE 'W'
+-#define V4VIOCSETRINGSIZE       _IOW (V4V_TYPE,  1, uint32_t)
+-
+-#define AUDIO_PORT 5001
+-
+-#define V4V_AUDIO_RING_SIZE (V4V_ROUNDUP((((4096)*32) - sizeof(v4v_ring_t)-V4V_ROUNDUP(1))))
+-
+-/* Messages definition */
+-#define AUDIO_INIT                             0x00
+-#define AUDIO_ALSA_OPEN                        0x01
+-#define AUDIO_VOLUME                           0x02
+-#define AUDIO_VOLUME_MONO                      0x03
+-
+-#define AUDIO_SND_PCM_CLOSE                    0x04
+-#define AUDIO_SND_PCM_PREPARE                  0x05
+-#define AUDIO_SND_PCM_DROP                     0x06
+-#define AUDIO_SND_PCM_AVAIL_UPDATE             0x07
+-#define AUDIO_SND_PCM_STATE                    0x08
+-#define AUDIO_SND_PCM_WRITEI                   0x09
+-#define AUDIO_SND_PCM_READI                    0x10
+-#define AUDIO_SND_PCM_RESUME                   0x11
+-#define AUDIO_VOL_CTRL_REMOVE                  0x12
+-
+-#define MAX_V4V_MSG_SIZE (V4V_AUDIO_RING_SIZE)
+-
+-struct audio_helper {
+-    int fd;
+-    v4v_addr_t remote_addr;
+-    v4v_addr_t local_addr;
+-    uint8_t io_buf[MAX_V4V_MSG_SIZE];
+-    int stubdom_id;
+-};
+-
+-static void ah_hex_dump(const void* address, uint32_t len)
+-{
+-    const unsigned char* p = address;
+-    int i, j;
+-
+-    for (i = 0; i < len; i += 16) {
+-   for (j = 0; j < 16 && i + j < len; j++)
+-       AH_LOG("%02x ", p[i + j]);
+-   for (; j < 16; j++)
+-       AH_LOG("   ");
+-   AH_LOG(" ");
+-   for (j = 0; j < 16 && i + j < len; j++)
+-       AH_LOG("%c", (p[i + j] < ' ' || p[i + j] > 0x7e) ? '.' : p[i + j]);
+-   AH_LOG("\n");
+-    }
+-}
+-
+-static int alsa_to_audfmt (snd_pcm_format_t alsafmt, audfmt_e *fmt,
+-                           int *endianness)
+-{
+-    AH_LOG("%s\n", __FUNCTION__);
+-    switch (alsafmt) {
+-    case SND_PCM_FORMAT_S8:
+-        *endianness = 0;
+-        *fmt = AUD_FMT_S8;
+-        break;
+-
+-    case SND_PCM_FORMAT_U8:
+-        *endianness = 0;
+-        *fmt = AUD_FMT_U8;
+-        break;
+-
+-    case SND_PCM_FORMAT_S16_LE:
+-        *endianness = 0;
+-        *fmt = AUD_FMT_S16;
+-        break;
+-
+-    case SND_PCM_FORMAT_U16_LE:
+-        *endianness = 0;
+-        *fmt = AUD_FMT_U16;
+-        break;
+-
+-    case SND_PCM_FORMAT_S16_BE:
+-        *endianness = 1;
+-        *fmt = AUD_FMT_S16;
+-        break;
+-
+-    case SND_PCM_FORMAT_U16_BE:
+-        *endianness = 1;
+-        *fmt = AUD_FMT_U16;
+-        break;
+-
+-    case SND_PCM_FORMAT_S32_LE:
+-        *endianness = 0;
+-        *fmt = AUD_FMT_S32;
+-        break;
+-
+-    case SND_PCM_FORMAT_U32_LE:
+-        *endianness = 0;
+-        *fmt = AUD_FMT_U32;
+-        break;
+-
+-    case SND_PCM_FORMAT_S32_BE:
+-        *endianness = 1;
+-        *fmt = AUD_FMT_S32;
+-        break;
+-
+-    case SND_PCM_FORMAT_U32_BE:
+-        *endianness = 1;
+-        *fmt = AUD_FMT_U32;
+-        break;
+-
+-    default:
+-        AH_LOG("Unrecognized audio format %d\n", alsafmt);
+-        return -1;
+-    }
+-
+-    return 0;
+-}
+-
+-void alsa_volume(int rvol, int lvol, int mute)
+-{
+-    static snd_mixer_t *handle = NULL;
+-    static const char *card = "default";
+-    snd_mixer_elem_t *elem;
+-    snd_mixer_selem_id_t *sid;
+-    int err, chn, volume;
+-
+-    AH_LOG("%s rvol=%d, lvol=%d, mute=%d\n",
+-      __FUNCTION__, rvol, lvol, mute);
+-    snd_mixer_selem_id_alloca(&sid);
+-
+-    if (handle == NULL) {
+-   if ((err = snd_mixer_open(&handle, 0)) < 0) {
+-       AH_LOG("Mixer %s open error: %s\n", card,
+-          snd_strerror(err));
+-       return;
+-   }
+-   if ((err = snd_mixer_attach(handle, card)) < 0) {
+-       AH_LOG("Mixer attach %s error: %s", card,
+-          snd_strerror(err));
+-       snd_mixer_close(handle);
+-       handle = NULL;
+-       return;
+-   }
+-   if ((err = snd_mixer_selem_register(handle, NULL, NULL)) < 0) {
+-       AH_LOG("Mixer register error: %s", snd_strerror(err));
+-       snd_mixer_close(handle);
+-       handle = NULL;
+-       return;
+-   }
+-   err = snd_mixer_load(handle);
+-   if (err < 0) {
+-       AH_LOG("Mixer %s load error: %s", card, snd_strerror(err));
+-       snd_mixer_close(handle);
+-       handle = NULL;
+-       return;
+-   }
+-    }
+-    snd_mixer_selem_id_set_index(sid, 0);
+-    snd_mixer_selem_id_set_name(sid, conf.volume_control);
+-    elem = snd_mixer_find_selem(handle, sid);
+-    if (!elem) {
+-   AH_LOG("Unable to find simple control '%s',%i\n",
+-          snd_mixer_selem_id_get_name(sid),
+-          snd_mixer_selem_id_get_index(sid));
+-   snd_mixer_close(handle);
+-   handle = NULL;
+-   return;
+-    }
+-
+-    for (chn = 0; chn <= SND_MIXER_SCHN_LAST; chn++) {
+-   if (!snd_mixer_selem_has_playback_channel(elem, chn))
+-       continue;
+-   if (snd_mixer_selem_has_playback_switch(elem))
+-       err = snd_mixer_selem_set_playback_switch(elem, chn, mute);
+-   else if (mute)
+-       rvol = lvol = 0;
+-   volume = (chn == 1) ? rvol : lvol;
+-   err = snd_mixer_selem_set_playback_volume(elem, chn, volume);
+-   if (err < 0) {
+-       AH_LOG("Unable to set volume for channel %d\n", chn);
+-       snd_mixer_close(handle);
+-       handle = NULL;
+-       return;
+-   }
+-    }
+-}
+-
+-void alsa_volume_mono(int chn, int vol, int mute)
+-{
+-
+-    static snd_mixer_t *handle = NULL;
+-    static const char *card = "default";
+-    snd_mixer_elem_t *elem;
+-    snd_mixer_selem_id_t *sid;
+-    int err, ok;
+-
+-    AH_LOG("%s chn=%d, vol=%d, mute=%d\n",
+-      __FUNCTION__, chn, vol, mute);
+-    snd_mixer_selem_id_alloca(&sid);
+-
+-    if (handle == NULL) {
+-
+-   if ((err = snd_mixer_open(&handle, 0)) < 0) {
+-       AH_LOG("Mixer %s open error: %s\n", card,
+-          snd_strerror(err));
+-       return;
+-   }
+-
+-   if ((err = snd_mixer_attach(handle, card)) < 0) {
+-       AH_LOG("Mixer attach %s error: %s", card,
+-          snd_strerror(err));
+-       snd_mixer_close(handle);
+-       handle = NULL;
+-       return;
+-   }
+-
+-   if ((err = snd_mixer_selem_register(handle, NULL, NULL)) < 0) {
+-       AH_LOG("Mixer register error: %s", snd_strerror(err));
+-       snd_mixer_close(handle);
+-       handle = NULL;
+-       return;
+-   }
+-
+-   err = snd_mixer_load(handle);
+-   if (err < 0) {
+-       AH_LOG("Mixer %s load error: %s", card, snd_strerror(err));
+-       snd_mixer_close(handle);
+-       handle = NULL;
+-       return;
+-   }
+-    }
+-
+-
+-    snd_mixer_selem_id_set_index(sid, 0);
+-    snd_mixer_selem_id_set_name(sid, conf.volume_control);
+-    elem = snd_mixer_find_selem(handle, sid);
+-    if (!elem) {
+-   AH_LOG("Unable to find simple control '%s',%i\n",
+-          snd_mixer_selem_id_get_name(sid),
+-          snd_mixer_selem_id_get_index(sid));
+-   snd_mixer_close(handle);
+-   handle = NULL;
+-   return;
+-    }
+-
+-
+-    ok = snd_mixer_selem_has_playback_channel(elem, chn);
+-
+-    if (ok) {
+-   if (snd_mixer_selem_has_playback_switch(elem))
+-       err = snd_mixer_selem_set_playback_switch(elem, chn, mute);
+-   else if (mute)
+-       vol = 0;
+-   err = snd_mixer_selem_set_playback_volume_range(elem, 0, 0x1F);
+-   if (err < 0)
+-       AH_LOG("Unable to set volume scale for channel %d\n", chn);
+-
+-   err = snd_mixer_selem_set_playback_volume(elem, chn, vol);
+-
+-   if (err < 0) {
+-       AH_LOG("Unable to set volume for channel %d\n", chn);
+-
+-       snd_mixer_close(handle);
+-       handle = NULL;
+-       return;
+-   }
+-    }
+-}
+-
+-static void alsa_set_threshold (snd_pcm_t *handle, snd_pcm_uframes_t threshold)
+-{
+-    int err;
+-    snd_pcm_sw_params_t *sw_params;
+-
+-    snd_pcm_sw_params_alloca (&sw_params);
+-
+-    err = snd_pcm_sw_params_current (handle, sw_params);
+-    if (err < 0) {
+-        AH_LOG("Could not fully initialize DAC\n");
+-        AH_LOG("Failed to get current software parameters\n");
+-        return;
+-    }
+-
+-    err = snd_pcm_sw_params_set_start_threshold (handle, sw_params, threshold);
+-    if (err < 0) {
+-        AH_LOG("Could not fully initialize DAC\n");
+-        AH_LOG("Failed to set software threshold to %ld\n",
+-          threshold);
+-        return;
+-    }
+-
+-    err = snd_pcm_sw_params (handle, sw_params);
+-    if (err < 0) {
+-        AH_LOG("Could not fully initialize DAC\n");
+-        AH_LOG("Failed to set software parameters\n");
+-        return;
+-    }
+-}
+-
+-static void alsa_anal_close (snd_pcm_t **handlep)
+-{
+-    int err = snd_pcm_close (*handlep);
+-    if (err) {
+-        AH_LOG("Failed to close PCM handle %p\n", *handlep);
+-    }
+-    *handlep = NULL;
+-}
+-
+-static void alsa_dump_info (struct alsa_params_req *req,
+-                            struct alsa_params_obt *obt)
+-{
+-    AH_LOG("parameter | requested value | obtained value\n");
+-    AH_LOG("format    |      %10d |     %10d\n", req->fmt, obt->fmt);
+-    AH_LOG("channels  |      %10d |     %10d\n",
+-           req->nchannels, obt->nchannels);
+-    AH_LOG("frequency |      %10d |     %10d\n", req->freq, obt->freq);
+-    AH_LOG("============================================\n");
+-    AH_LOG("requested: buffer size %d period size %d\n",
+-           req->buffer_size, req->period_size);
+-    AH_LOG("obtained: samples %ld\n", obt->samples);
+-}
+-
+-static int alsa_open (int in, struct alsa_params_req *req,
+-             struct alsa_params_obt *obt, snd_pcm_t **handlep)
+-{
+-    snd_pcm_t *handle;
+-    snd_pcm_hw_params_t *hw_params;
+-    int err;
+-    int size_in_usec;
+-    unsigned int freq, nchannels;
+-    const char *pcm_name = in ? conf.pcm_name_in : conf.pcm_name_out;
+-    snd_pcm_uframes_t obt_buffer_size;
+-    const char *typ = in ? "ADC" : "DAC";
+-    snd_pcm_format_t obtfmt;
+-
+-    AH_LOG("%s\n", __FUNCTION__);
+-
+-    freq = req->freq;
+-    nchannels = req->nchannels;
+-    size_in_usec = req->size_in_usec;
+-
+-    snd_pcm_hw_params_alloca (&hw_params);
+-
+-    err = snd_pcm_open (
+-           &handle,
+-           pcm_name,
+-           in ? SND_PCM_STREAM_CAPTURE : SND_PCM_STREAM_PLAYBACK,
+-           SND_PCM_NONBLOCK
+-           );
+-    if (err < 0) {
+-        AH_LOG("Failed to open `%s':\n", pcm_name);
+-        return -1;
+-    }
+-
+-    /* Close and then open again: volume control seems to only work
+-     * after the device has been closed once. */
+-    err = snd_pcm_close(handle);
+-    if (err < 0) {
+-   AH_LOG("Failed to close `%s':\n", pcm_name);
+-   return -1;
+-    }
+-
+-    err = snd_pcm_open (
+-           &handle,
+-           pcm_name,
+-           in ? SND_PCM_STREAM_CAPTURE : SND_PCM_STREAM_PLAYBACK,
+-           SND_PCM_NONBLOCK
+-           );
+-    if (err < 0) {
+-        AH_LOG("Failed to re-open `%s':\n", pcm_name);
+-        return -1;
+-    }
+-    AH_LOG("handle=%p\n", handle);
+-    err = snd_pcm_hw_params_any (handle, hw_params);
+-    if (err < 0) {
+-        AH_LOG("Failed to initialize hardware parameters\n");
+-        goto err;
+-    }
+-
+-    err = snd_pcm_hw_params_set_access (
+-                   handle,
+-                   hw_params,
+-                   SND_PCM_ACCESS_RW_INTERLEAVED
+-                   );
+-    if (err < 0) {
+-        AH_LOG("Failed to set access type\n");
+-        goto err;
+-    }
+-
+-    err = snd_pcm_hw_params_set_format (handle, hw_params, req->fmt);
+-    if (err < 0 && conf.verbose) {
+-        AH_LOG("Failed to set format %d\n", req->fmt);
+-    }
+-
+-    err = snd_pcm_hw_params_set_rate_near (handle, hw_params, &freq, 0);
+-    if (err < 0) {
+-        AH_LOG("Failed to set frequency %d\n", req->freq);
+-        goto err;
+-    }
+-
+-    err = snd_pcm_hw_params_set_channels_near (
+-                          handle,
+-                          hw_params,
+-                          &nchannels
+-                          );
+-    if (err < 0) {
+-        AH_LOG("Failed to set number of channels %d\n",
+-          req->nchannels);
+-        goto err;
+-    }
+-
+-    if (nchannels != 1 && nchannels != 2) {
+-   AH_LOG("Can not handle obtained number of channels %d\n",
+-          nchannels);
+-        goto err;
+-    }
+-
+-    if (req->buffer_size) {
+-        unsigned long obt;
+-
+-        if (size_in_usec) {
+-            int dir = 0;
+-            unsigned int btime = req->buffer_size;
+-
+-            err = snd_pcm_hw_params_set_buffer_time_near (
+-                             handle,
+-                             hw_params,
+-                             &btime,
+-                             &dir
+-                             );
+-            obt = btime;
+-        }
+-        else {
+-            snd_pcm_uframes_t bsize = req->buffer_size;
+-
+-            err = snd_pcm_hw_params_set_buffer_size_near (
+-                             handle,
+-                             hw_params,
+-                             &bsize
+-                             );
+-            obt = bsize;
+-        }
+-        if (err < 0) {
+-            AH_LOG("Failed to set buffer %s to %d\n",
+-          size_in_usec ? "time" : "size", req->buffer_size);
+-            goto err;
+-        }
+-
+-        if ((req->override_mask & 2) && (obt - req->buffer_size))
+-            AH_LOG("Requested buffer %s %u was rejected, using %lu\n",
+-                   size_in_usec ? "time" : "size", req->buffer_size, obt);
+-    }
+-
+-    if (req->period_size) {
+-        unsigned long obt;
+-
+-        if (size_in_usec) {
+-            int dir = 0;
+-            unsigned int ptime = req->period_size;
+-
+-            err = snd_pcm_hw_params_set_period_time_near (
+-                             handle,
+-                             hw_params,
+-                             &ptime,
+-                             &dir
+-                             );
+-            obt = ptime;
+-        }
+-        else {
+-            int dir = 0;
+-            snd_pcm_uframes_t psize = req->period_size;
+-
+-            err = snd_pcm_hw_params_set_period_size_near (
+-                             handle,
+-                             hw_params,
+-                             &psize,
+-                             &dir
+-                             );
+-            obt = psize;
+-        }
+-
+-        if (err < 0) {
+-            AH_LOG("Failed to set period %s to %d\n",
+-          size_in_usec ? "time" : "size", req->period_size);
+-            goto err;
+-        }
+-
+-        if ((req->override_mask & 1) && (obt - req->period_size))
+-            AH_LOG("Requested period %s %u was rejected, using %lu\n",
+-                   size_in_usec ? "time" : "size", req->period_size, obt);
+-    }
+-
+-    err = snd_pcm_hw_params (handle, hw_params);
+-    if (err < 0) {
+-        AH_LOG("Failed to apply audio parameters\n");
+-        goto err;
+-    }
+-
+-    err = snd_pcm_hw_params_get_buffer_size (hw_params, &obt_buffer_size);
+-    if (err < 0) {
+-        AH_LOG("Failed to get buffer size\n");
+-        goto err;
+-    }
+-
+-#if 0
+-    err = snd_pcm_hw_params_get_format (hw_params, &obtfmt);
+-    if (err < 0) {
+-        AH_LOG("Failed to get format\n");
+-        goto err;
+-    }
+-#else
+-    obtfmt = req->fmt;
+-#endif
+-
+-    if (alsa_to_audfmt (obtfmt, &obt->fmt, &obt->endianness)) {
+-        AH_LOG("Invalid format was returned %d\n", obtfmt);
+-        goto err;
+-    }
+-
+-    err = snd_pcm_prepare (handle);
+-    if (err < 0) {
+-        AH_LOG("Could not prepare handle %p\n", handle);
+-        goto err;
+-    }
+-
+-    if (!in && conf.threshold) {
+-        snd_pcm_uframes_t threshold;
+-        int bytes_per_sec;
+-
+-        bytes_per_sec = freq << (nchannels == 2);
+-
+-        switch (obt->fmt) {
+-        case AUD_FMT_S8:
+-        case AUD_FMT_U8:
+-            break;
+-
+-        case AUD_FMT_S16:
+-        case AUD_FMT_U16:
+-            bytes_per_sec <<= 1;
+-            break;
+-
+-        case AUD_FMT_S32:
+-        case AUD_FMT_U32:
+-            bytes_per_sec <<= 2;
+-            break;
+-        }
+-
+-        threshold = (conf.threshold * bytes_per_sec) / 1000;
+-        alsa_set_threshold (handle, threshold);
+-    }
+-
+-    obt->nchannels = nchannels;
+-    obt->freq = freq;
+-    obt->samples = obt_buffer_size;
+-
+-    *handlep = handle;
+-
+-    /*     if (conf.verbose && */
+-    /*         (obt->fmt != req->fmt || */
+-    /*          obt->nchannels != req->nchannels || */
+-    /*          obt->freq != req->freq)) { */
+-    /*         AH_LOG("Audio paramters for %s\n", typ); */
+-    /*         alsa_dump_info (req, obt); */
+-    /*     } */
+-
+-#ifdef AUDIO_DEBUG
+-    alsa_dump_info (req, obt);
+-#endif
+-    return 0;
+-
+-    err:
+-    alsa_anal_close (&handle);
+-    return -1;
+-}
+-
+-static void handle_audio_vol_ctrl_remove_cmd(struct audio_helper *ah,
+-                        uint8_t *buf, size_t len)
+-{
+-    snd_ctl_t *ctl;
+-    int err;
+-
+-    err = snd_ctl_open(&ctl, "default", 0);
+-    if (err<0){
+-        return;
+-    }
+-
+-    snd_ctl_elem_id_t *id;
+-    snd_ctl_elem_id_alloca(&id);
+-    snd_ctl_elem_id_set_interface(id, SND_CTL_ELEM_IFACE_MIXER);
+-
+-    snd_ctl_elem_id_set_name(id, volume_control);
+-    snd_ctl_elem_value_t *control;
+-    snd_ctl_elem_value_alloca(&control);
+-    snd_ctl_elem_value_set_id(control, id);
+-
+-    err = snd_ctl_elem_remove(ctl, id);
+-    snd_ctl_close(ctl);
+-}
+-
+-static void handle_audio_init_cmd(struct audio_helper *ah,
+-                 uint8_t *buf, size_t len)
+-{
+-    uint8_t *ptr = buf;
+-
+-    AH_LOG("handle_audio_init_cmd\n");
+-
+-    ptr += 1;
+-
+-    memcpy(&conf, ptr, sizeof(conf));
+-    ptr += sizeof(conf);
+-
+-    conf.pcm_name_in = pcm_name_in;
+-    conf.pcm_name_out = pcm_name_out;
+-    conf.volume_control = volume_control;
+-
+-    sprintf(pcm_name_in, "dsnoop0");
+-    sprintf(pcm_name_out, "plug:vm-%d", ah->stubdom_id - 1);
+-    sprintf(volume_control, "vm-%d", ah->stubdom_id - 1);
+-
+-    /* memcpy(pcm_name_in, ptr, strlen(ptr) + 1); */
+-    /* AH_LOG("pcm_name_in=%s\n", conf.pcm_name_in); */
+-    /* ptr += (strlen(ptr) + 1); */
+-
+-    /* memcpy(pcm_name_out, ptr, strlen(ptr) + 1); */
+-    /* AH_LOG("pcm_name_out=%s\n", conf.pcm_name_out); */
+-    /* ptr += (strlen(ptr) + 1); */
+-
+-    /* memcpy(volume_control, ptr, strlen(ptr) + 1); */
+-    /* AH_LOG("volume_control=%s\n", conf.volume_control); */
+-    /* ptr += (strlen(ptr) + 1); */
+-
+-}
+-
+-static void handle_audio_alsa_open_cmd(struct audio_helper *ah,
+-                      uint8_t *buf, size_t len)
+-{
+-    uint8_t *ptr = buf;
+-    int in;
+-    struct alsa_params_req req;
+-    struct alsa_params_obt obt;
+-    snd_pcm_t *handle = 0;
+-    int ret;
+-
+-    ptr += 1;
+-
+-    memcpy(&in, ptr, sizeof(in));
+-    ptr += sizeof(in);
+-
+-    memcpy(&req, ptr, sizeof(req));
+-    ptr += sizeof(req);
+-
+-    memcpy(&obt, ptr, sizeof(obt));
+-    ptr += sizeof(obt);
+-
+-    ret = alsa_open (in, &req, &obt, &handle);
+-
+-    ptr = buf;
+-
+-    ptr++;
+-
+-    memcpy(ptr, &obt, sizeof(obt));
+-    ptr += sizeof(obt);
+-
+-    memcpy(ptr, &handle, sizeof(handle));
+-    ptr += sizeof(handle);
+-
+-    memcpy(ptr, &ret, sizeof(ret));
+-    ptr += sizeof(ret);
+-
+-    v4v_sendto(ah->fd, buf, ptr - buf, 0, &ah->remote_addr);
+-}
+-
+-static void handle_audio_volume_cmd(struct audio_helper *ah,
+-                   uint8_t *buf, size_t len)
+-{
+-    uint8_t *ptr = buf;
+-    int rvol, lvol, mute;
+-
+-    ptr += 1;
+-
+-    memcpy(&rvol, ptr, sizeof(int));
+-    ptr += sizeof(int);
+-
+-    memcpy(&lvol, ptr, sizeof(int));
+-    ptr += sizeof(int);
+-
+-    memcpy(&mute, ptr, sizeof(int));
+-
+-    alsa_volume(rvol, lvol, mute);
+-}
+-
+-static void handle_audio_volume_mono_cmd(struct audio_helper *ah,
+-                    uint8_t *buf, size_t len)
+-{
+-    uint8_t *ptr = buf;
+-    int chn, vol, mute;
+-
+-    ptr += 1;
+-
+-    memcpy(&chn, ptr, sizeof(int));
+-    ptr += sizeof(int);
+-
+-    memcpy(&vol, ptr, sizeof(int));
+-    ptr += sizeof(int);
+-
+-    memcpy(&mute, ptr, sizeof(int));
+-
+-    alsa_volume_mono(chn, vol, mute);
+-}
+-
+-static void handle_audio_snd_pcm_close_cmd(struct audio_helper *ah,
+-                      uint8_t *buf, size_t len)
+-{
+-    uint8_t *ptr = buf + 1;
+-    snd_pcm_t *handle;
+-    int ret;
+-
+-    memcpy(&handle, ptr, sizeof(handle));
+-
+-    ret = snd_pcm_close(handle);
+-
+-    ptr = buf + 1;
+-    memcpy(ptr, &ret, sizeof(int));
+-    ptr += sizeof(int);
+-
+-    v4v_sendto(ah->fd, buf, ptr - buf, 0, &ah->remote_addr);
+-}
+-
+-static void handle_audio_snd_pcm_prepare_cmd(struct audio_helper *ah,
+-                        uint8_t *buf, size_t len)
+-{
+-    uint8_t *ptr = buf + 1;
+-    snd_pcm_t *handle;
+-    int ret;
+-
+-    memcpy(&handle, ptr, sizeof(handle));
+-
+-    ret = snd_pcm_prepare(handle);
+-
+-    ptr = buf + 1;
+-    memcpy(ptr, &ret, sizeof(int));
+-    ptr += sizeof(int);
+-
+-    v4v_sendto(ah->fd, buf, ptr - buf, 0, &ah->remote_addr);
+-}
+-
+-static void handle_audio_snd_pcm_drop_cmd(struct audio_helper *ah,
+-                     uint8_t *buf, size_t len)
+-{
+-    uint8_t *ptr = buf + 1;
+-    snd_pcm_t *handle;
+-    int ret;
+-
+-    memcpy(&handle, ptr, sizeof(handle));
+-
+-    ret = snd_pcm_drop(handle);
+-
+-    ptr = buf + 1;
+-    memcpy(ptr, &ret, sizeof(int));
+-    ptr += sizeof(int);
+-
+-    v4v_sendto(ah->fd, buf, ptr - buf, 0, &ah->remote_addr);
+-}
+-
+-static void handle_audio_snd_pcm_avail_update_cmd(struct audio_helper *ah,
+-                         uint8_t *buf, size_t len)
+-{
+-    uint8_t *ptr = buf + 1;
+-    snd_pcm_t *handle;
+-    int ret;
+-
+-    memcpy(&handle, ptr, sizeof(handle));
+-
+-    ret = snd_pcm_avail_update(handle);
+-
+-    ptr = buf + 1;
+-    memcpy(ptr, &ret, sizeof(int));
+-    ptr += sizeof(int);
+-
+-    v4v_sendto(ah->fd, buf, ptr - buf, 0, &ah->remote_addr);
+-}
+-
+-static void handle_audio_snd_pcm_state_cmd(struct audio_helper *ah,
+-                      uint8_t *buf, size_t len)
+-{
+-    uint8_t *ptr = buf + 1;
+-    snd_pcm_t *handle;
+-    int ret;
+-
+-    memcpy(&handle, ptr, sizeof(handle));
+-
+-    ret = snd_pcm_state(handle);
+-
+-    ptr = buf + 1;
+-    memcpy(ptr, &ret, sizeof(int));
+-    ptr += sizeof(int);
+-
+-    v4v_sendto(ah->fd, buf, ptr - buf, 0, &ah->remote_addr);
+-}
+-
+-static void handle_audio_snd_pcm_resume_cmd(struct audio_helper *ah,
+-                       uint8_t *buf, size_t len)
+-{
+-    uint8_t *ptr = buf + 1;
+-    snd_pcm_t *handle;
+-    int ret;
+-
+-    memcpy(&handle, ptr, sizeof(handle));
+-
+-    ret = snd_pcm_resume(handle);
+-
+-    ptr = buf + 1;
+-    memcpy(ptr, &ret, sizeof(int));
+-    ptr += sizeof(int);
+-
+-    v4v_sendto(ah->fd, buf, ptr - buf, 0, &ah->remote_addr);
+-}
+-
+-static void handle_audio_snd_pcm_writei_cmd(struct audio_helper *ah,
+-                       uint8_t *buf, size_t len)
+-{
+-    uint8_t *ptr = buf + 1;
+-    snd_pcm_t *handle;
+-    int size;
+-    int ret;
+-
+-    memcpy(&handle, ptr, sizeof(handle));
+-    ptr += sizeof(handle);
+-
+-    memcpy(&size, ptr, sizeof(int));
+-    ptr += sizeof(int);
+-
+-    ret = snd_pcm_writei(handle, ptr, size);
+-
+-    ptr = buf + 1;
+-    memcpy(ptr, &ret, sizeof(int));
+-    ptr += sizeof(int);
+-
+-    v4v_sendto(ah->fd, buf, ptr - buf, 0, &ah->remote_addr);
+-}
+-
+-static void handle_audio_snd_pcm_readi_cmd(struct audio_helper *ah,
+-                      uint8_t *buf, size_t len)
+-{
+-    uint8_t *ptr = buf + 1;
+-    snd_pcm_t *handle;
+-    int size;
+-    int ret;
+-
+-    memcpy(&handle, ptr, sizeof(handle));
+-    ptr += sizeof(handle);
+-
+-    memcpy(&size, ptr, sizeof(int));
+-
+-    ret = snd_pcm_readi(handle, buf + sizeof(int) + 1, size);
+-
+-    ptr = buf + 1;
+-    memcpy(ptr, &ret, sizeof(int));
+-    ptr += sizeof(int);
+-
+-    if (ret > 0)
+-      v4v_sendto(ah->fd, buf, ptr - buf + (ret * 4), 0, &ah->remote_addr);
+-    else
+-      v4v_sendto(ah->fd, buf, ptr - buf, 0, &ah->remote_addr);
+-}
+-
+-/* This helper needs the stubdom_id to be passed as a cmd-line parameter */
+-int main (int argc, char *argv[])
+-{
+-    int ret;
+-    struct audio_helper *ah = malloc(sizeof(struct audio_helper));
+-    uint32_t v4v_ring_size = V4V_AUDIO_RING_SIZE;
+-
+-    if (argc != 2) {
+-   AH_LOG("wrong syntax: should be ./audio_helper <stubdom_id>\n");
+-    }
+-
+-    ah->stubdom_id = atoi(argv[1]);
+-    AH_LOG("stubdom_id = %d\n", ah->stubdom_id);
+-    ah->fd = v4v_socket(SOCK_DGRAM);
+-    if (ah->fd == -1) {
+-   ret = -1;
+-   return ret;
+-    }
+-
+-    if (ah->stubdom_id > 0) {
+-   ah->local_addr.port = AUDIO_PORT;
+-   ah->local_addr.domain = V4V_DOMID_ANY;
+-
+-   ah->remote_addr.port = V4V_PORT_NONE;
+-   ah->remote_addr.domain = ah->stubdom_id;
+-
+-   ret = ioctl(ah->fd, V4VIOCSETRINGSIZE, &v4v_ring_size);
+-   AH_LOG("%s:%d ioctl=%d\n", __FUNCTION__, __LINE__, ret);
+-
+-   ret = v4v_bind(ah->fd, &ah->local_addr, ah->stubdom_id);
+-   if (ret == -1) {
+-       return ret;
+-   }
+-
+-   while (1) {
+-       ret = v4v_recvfrom(ah->fd, ah->io_buf,
+-                  MAX_V4V_MSG_SIZE, 0, &ah->remote_addr);
+-       //AH_LOG("recvfrom = %d, CMD=%d\n", ret, ah->io_buf[0]);
+-
+-       switch(ah->io_buf[0]) {
+-       case AUDIO_INIT:
+-       handle_audio_init_cmd(ah, ah->io_buf, ret);
+-       break;
+-       case AUDIO_ALSA_OPEN:
+-       handle_audio_alsa_open_cmd(ah, ah->io_buf, ret);
+-       break;
+-       case AUDIO_VOLUME:
+-       handle_audio_volume_cmd(ah, ah->io_buf, ret);
+-       break;
+-       case AUDIO_VOLUME_MONO:
+-       handle_audio_volume_mono_cmd(ah, ah->io_buf, ret);
+-       break;
+-       case AUDIO_SND_PCM_CLOSE:
+-       handle_audio_snd_pcm_close_cmd(ah, ah->io_buf, ret);
+-       break;
+-       case AUDIO_SND_PCM_PREPARE:
+-       handle_audio_snd_pcm_prepare_cmd(ah, ah->io_buf, ret);
+-       break;
+-       case AUDIO_SND_PCM_DROP:
+-       handle_audio_snd_pcm_drop_cmd(ah, ah->io_buf, ret);
+-       break;
+-       case AUDIO_SND_PCM_AVAIL_UPDATE:
+-       handle_audio_snd_pcm_avail_update_cmd(ah, ah->io_buf, ret);
+-       break;
+-       case AUDIO_SND_PCM_STATE:
+-       handle_audio_snd_pcm_state_cmd(ah, ah->io_buf, ret);
+-       break;
+-       case AUDIO_SND_PCM_WRITEI:
+-       handle_audio_snd_pcm_writei_cmd(ah, ah->io_buf, ret);
+-       break;
+-       case AUDIO_SND_PCM_READI:
+-       handle_audio_snd_pcm_readi_cmd(ah, ah->io_buf, ret);
+-       break;
+-       case AUDIO_SND_PCM_RESUME:
+-       handle_audio_snd_pcm_resume_cmd(ah, ah->io_buf, ret);
+-       break;
+-       case AUDIO_VOL_CTRL_REMOVE:
+-       handle_audio_vol_ctrl_remove_cmd(ah, ah->io_buf, ret);
+-       break;
+-       default:
+-       AH_LOG("Unknown CMD=%d\n", ah->io_buf[0]);
+-       }
+-   }
+-    } else {
+-   AH_LOG("wrong stubdom_id: must be bigger than 0\n");
+-    }
+-
+-    free(ah);
+-
+-    return 0;
+-}
+-
+-
+diff -Naur xctools/audio_helper/src/Makefile.am xctools-audio-helper/audio_helper/src/Makefile.am
+--- xctools/audio_helper/src/Makefile.am    2015-02-20 10:30:32.269561814 -0500
++++ xctools-audio-helper/audio_helper/src/Makefile.am   2015-03-12 09:45:45.779236406 -0400
+@@ -41,7 +41,7 @@
+ 
+ bin_PROGRAMS = audio_helper
+ 
+-SRCS=audio_helper.c version.c
++SRCS=openxtaudio.c openxtv4v.c openxtdebug.c unittest.c version.c
+ audio_helper_SOURCES = ${SRCS}
+ audio_helper_LDADD = -lxenstore -lv4v -lrt -lasound -ldl -lm
+ 
+diff -Naur xctools/audio_helper/src/openxtaudio.c xctools-audio-helper/audio_helper/src/openxtaudio.c
+--- xctools/audio_helper/src/openxtaudio.c  1969-12-31 19:00:00.000000000 -0500
++++ xctools-audio-helper/audio_helper/src/openxtaudio.c 2015-03-12 09:43:22.679232362 -0400
+@@ -0,0 +1,578 @@
++#include "project.h"
++
++#include "openxtv4v.h"
++#include "openxtdebug.h"
++#include "openxtaudio.h"
++#include "openxtpackets.h"
++
++#include "unittest.h"
++
++////////////////////////////////////////////////////////////////////////////////
++// Global Data / Structures                                                   //
++////////////////////////////////////////////////////////////////////////////////
++
++Settings playback_settings;
++Settings capture_settings;
++
++char pcm_name_in[256];
++char pcm_name_out[256];
++char volume_control[256];
++
++// Global V4V Packets
++V4VPacket snd_packet;
++V4VPacket rcv_packet;
++
++// GLobal V4V Connection
++V4VConnection *conn = NULL;
++
++// Global V4V Packet Bodies
++OpenXTPlaybackPacket *playback_packet = NULL;
++OpenXTSetVolumePacket *set_volume_packet = NULL;
++OpenXTPlaybackAckPacket *playback_ack_packet = NULL;
++OpenXTInitPlaybackPacket *init_playback_packet = NULL;
++OpenXTInitPlaybackAckPacket *init_playback_ack_packet = NULL;
++OpenXTGetAvailableAckPacket *get_available_ack_packet = NULL;
++
++////////////////////////////////////////////////////////////////////////////////
++// Alsa Functions                                                             //
++////////////////////////////////////////////////////////////////////////////////
++
++int openxt_alsa_remove_pcm(void)
++{
++    int ret;
++    snd_ctl_t *ctl;
++    snd_ctl_elem_id_t *id;
++
++    // Santiy checks
++    openxt_assert_quiet(is_unittest() == false, 0);
++
++    // Open the ALSA control interface
++    openxt_assert((ret = snd_ctl_open(&ctl, "default", 0)) == 0, ret);
++    openxt_assert((ret = snd_ctl_elem_id_malloc(&id)) == 0, ret);
++    snd_ctl_elem_id_set_interface(id, SND_CTL_ELEM_IFACE_MIXER);
++    snd_ctl_elem_id_set_name(id, volume_control);
++
++    // Remove the PCM
++    openxt_assert((ret = snd_ctl_elem_remove(ctl, id)) == 0, ret);
++
++    // Cleanup
++    snd_ctl_elem_id_free(id);
++    snd_ctl_close(ctl);
++
++    // Success
++    return 0;
++}
++
++int openxt_alsa_mixer_fini(Settings *settings)
++{
++    int ret = 0;
++
++    // Sanity checks
++    openxt_checkp(settings, -EINVAL);
++
++    // Cleanup
++    if (settings->mhandle != NULL) {
++
++        // Remove the PCM
++        openxt_alsa_remove_pcm();
++
++        // Close the mixer
++        ret = snd_mixer_close(settings->mhandle);
++    }
++
++    // Reset
++    settings->mhandle = NULL;
++
++    // Done
++    openxt_info("alsa mixer closed\n");
++    return ret;
++
++}
++
++int openxt_alsa_mixer_init(Settings *settings)
++{
++    int ret;
++
++    // Sanity checks
++    openxt_checkp(settings, -EINVAL);
++    openxt_assert_quiet(settings->mhandle == NULL, 0);
++
++    // Setup the handle
++    openxt_assert_goto((ret = snd_mixer_open(&settings->mhandle, 0)) == 0, failure);
++    openxt_assert_goto((ret = snd_mixer_attach(settings->mhandle, "default")) == 0, failure);
++    openxt_assert_goto((ret = snd_mixer_selem_register(settings->mhandle, NULL, NULL)) == 0, failure);
++    openxt_assert_goto((ret = snd_mixer_load(settings->mhandle)) == 0, failure);
++
++    // Success
++    openxt_info("alsa mixer open\n");
++    return 0;
++
++failure:
++
++    // Safety
++    openxt_alsa_mixer_fini(settings);
++
++    // Failure
++    openxt_error("failed to open alsa mixer: %d - %s\n", ret, snd_strerror(ret));
++    return ret;
++}
++
++int openxt_alsa_fini(Settings *settings)
++{
++    int ret = 0;
++
++    // Sanity checks
++    openxt_checkp(settings, -EINVAL);
++
++    // Cleanup
++    if (settings->handle != NULL) 
++        ret = snd_pcm_close(settings->handle);
++
++    // Reset
++    settings->handle = NULL;
++
++    // Done
++    openxt_info("alsa closed\n");
++    return ret;
++}
++
++int openxt_alsa_init(Settings *settings, char *name, snd_pcm_stream_t stream)
++{
++    int ret;
++    snd_pcm_hw_params_t *hw_params = NULL;
++
++    // Sanity checks
++    openxt_checkp(name, -EINVAL);
++    openxt_checkp(settings, -EINVAL);
++    openxt_assert_quiet(settings->handle == NULL, 0);
++
++    // ALSA BUG: This is a bug with ALSA, that can be easily reproduced. 
++    // Basically when using the "softvol" plugin (like we do), the plugin 
++    // ends up locking the PCM when it is created once opened, and this lock 
++    // cannot be removed (you get an EPERM when you attempt to unlock). For 
++    // now, the easy solution is to open the PCM, close it, and re-open it. 
++    // For whatever reason, when you re-open the PCM, it's state is normal. 
++    openxt_assert((ret = snd_pcm_open(&(settings->handle), name, stream, 0)) == 0, ret);
++    snd_pcm_close(settings->handle);
++
++    // Open the ALSA device for this VM, and allocate an opaque buffer to store
++    // the parameters that are used to setup ALSA. Note that a lot of the examples
++    // use the alloca version, but we found that it had issues with the stack, so 
++    // this code uses the malloc version.
++    openxt_assert((ret = snd_pcm_open(&(settings->handle), name, stream, 0)) == 0, ret);
++    openxt_assert_goto((ret = snd_pcm_hw_params_malloc(&hw_params)) == 0, failure);
++
++    // Setup the parameters from the settings that were provided to us, as well 
++    // as settings that are specific to our environment (things that QEMU 
++    // doesn't actually provide us). Note that the freq (rate) setting needs to 
++    // be set using the "near" function which could change the value of freq 
++    // if it could not match exactly. For this reason, we will ack back this 
++    // freq so that QEMU knows what to be set too. 
++    openxt_assert_goto((ret = snd_pcm_hw_params_any(settings->handle, hw_params)) == 0, failure);    
++    openxt_assert_goto((ret = snd_pcm_hw_params_set_access(settings->handle, hw_params, SND_PCM_ACCESS_RW_INTERLEAVED)) == 0, failure);    
++    openxt_assert_goto((ret = snd_pcm_hw_params_set_format(settings->handle, hw_params, settings->fmt)) == 0, failure);    
++    openxt_assert_goto((ret = snd_pcm_hw_params_set_rate_near(settings->handle, hw_params, &settings->freq, 0)) == 0, failure);    
++    openxt_assert_goto((ret = snd_pcm_hw_params_set_channels(settings->handle, hw_params, settings->nchannels)) == 0, failure);    
++    
++    // The following commits these settings.
++    openxt_assert_goto((ret = snd_pcm_hw_params(settings->handle, hw_params)) == 0, failure);
++
++    // Cleanup
++    snd_pcm_hw_params_free(hw_params);
++
++    // Success
++    openxt_info("alsa \"%s\" open\n", snd_pcm_name(settings->handle));
++    return 0;
++
++failure:
++
++    // Cleanup
++    if (hw_params != NULL)
++        snd_pcm_hw_params_free(hw_params);
++
++    // Safety
++    openxt_alsa_fini(settings);
++
++    // Failure
++    openxt_error("failed to open alsa: %d - %s\n", ret, snd_strerror(ret));
++    return -1;
++}
++
++int openxt_alsa_prepare(Settings *settings)
++{
++    // Sanity check
++    openxt_checkp(settings, -EINVAL);
++    openxt_checkp(settings->handle, -EINVAL);
++
++    // Prepare ALSA
++    return snd_pcm_prepare(settings->handle);
++}
++
++int openxt_alsa_drop(Settings *settings)
++{
++    // Sanity check
++    openxt_checkp(settings, -EINVAL);
++    openxt_checkp(settings->handle, -EINVAL);
++
++    // Prepare ALSA
++    return snd_pcm_drop(settings->handle);
++}
++
++int openxt_alsa_get_available(Settings *settings)
++{
++    int ret;
++
++    // Sanity checks
++    openxt_checkp(settings, -EINVAL);
++    openxt_checkp(settings->handle, -EINVAL);
++
++    // We add this loop here because if we get an EPIPE error, we need to 
++    // try again, and this provides an easy way to do that. 
++    while(1) {
++
++        if ((ret = snd_pcm_avail(settings->handle)) < 0) {
++
++            // Check for EPIPE (xrun / suspended). If this is the case, we 
++            // restart ALSA and try again. 
++            if (ret == -EPIPE) {
++                openxt_assert((ret = openxt_alsa_prepare(settings)) == 0, ret);
++                continue;
++            }
++
++            // If we got this far, we got have an error. 
++            openxt_error("snd_pcm_avail failed: %d - %s\n", ret, snd_strerror(ret));
++
++            // If this happens, no samples are available
++            ret = 0;
++        }
++
++        // Done
++        break;
++    }
++
++    // Return the number of samples
++    return ret;
++}
++
++int openxt_alsa_writei(Settings *settings, char *buffer, int32_t num, int32_t size)
++{
++    int ret;
++
++    // Sanity checks
++    openxt_checkp(buffer, -EINVAL);
++    openxt_checkp(settings, -EINVAL);
++    openxt_checkp(settings->handle, -EINVAL);
++    openxt_assert(settings->sample_size * num <= size, -EINVAL);
++
++    // No need to run this if we are writing 0 samples
++    if (num <= 0)
++        return 0;
++
++    // We add this loop here because if we get an EPIPE error, we need to 
++    // try again, and this provides an easy way to do that. 
++    while(1) {
++
++        if ((ret = snd_pcm_writei(settings->handle, buffer, num)) < 0) {
++
++            // Check for EPIPE (xrun / suspended). If this is the case, we 
++            // restart ALSA and try again. 
++            if (ret == -EPIPE) {
++                openxt_assert((ret = openxt_alsa_prepare(settings)) == 0, ret);
++                continue;
++            }
++
++            // If we got this far, we got have an error. 
++            openxt_error("snd_pcm_writei failed: %d - %s\n", ret, snd_strerror(ret));
++            break;
++        }
++
++        // Make sure that all of the samples were written
++        if (ret != num) {
++            openxt_error("snd_pcm_writei dropped samples: %d\n", num - ret);
++            break;
++        }
++
++        // Done
++        break;
++    }
++
++    // Done
++    return ret;
++}
++
++int openxt_alsa_set_playback_volume(Settings *settings, int64_t left, int64_t right)
++{
++    int ret;
++    snd_mixer_elem_t *elem = NULL;
++    snd_mixer_selem_id_t *selem_id = NULL;
++
++    // Sanity checks
++    openxt_checkp(settings, -EINVAL);
++    openxt_checkp(settings->mhandle, -EINVAL);
++
++    // Create the simple element id. Note, originally I figured you could just
++    // put this part in the init function, but if you do that, the volume will
++    // only change once. In other words, ALSA expects that you will do this 
++    // each time you need to change the volume. 
++    openxt_assert_goto((ret = snd_mixer_selem_id_malloc(&selem_id)) == 0, failure);
++    snd_mixer_selem_id_set_name(selem_id, volume_control);
++    snd_mixer_selem_id_set_index(selem_id, 0);
++
++    // Get the element described by the simple element id that was setup in the 
++    // init function.
++    openxt_checkp_goto((elem = snd_mixer_find_selem(settings->mhandle, selem_id)), failure);
++
++    // Make sure that we have the correct channels. Currently we only support 
++    // 2 channels. If we need to support more, we would need to provide better
++    // logic here. 
++    openxt_assert_goto(snd_mixer_selem_has_playback_channel(elem, SND_MIXER_SCHN_FRONT_LEFT) != 0, failure);
++    openxt_assert_goto(snd_mixer_selem_has_playback_channel(elem, SND_MIXER_SCHN_FRONT_RIGHT) != 0, failure);
++
++    // Make sure that the min and max volume for this element is set correctly.
++    openxt_assert_goto((ret = snd_mixer_selem_set_playback_volume_range(elem, 0, 255)) == 0, failure);
++    openxt_assert_goto(left >= 0 && left <= 255, failure);
++    openxt_assert_goto(right >= 0 && right <= 255, failure);
++
++    // Set the volume
++    openxt_assert_goto((ret = snd_mixer_selem_set_playback_volume(elem, SND_MIXER_SCHN_FRONT_LEFT, left)) == 0, failure);
++    openxt_assert_goto((ret = snd_mixer_selem_set_playback_volume(elem, SND_MIXER_SCHN_FRONT_RIGHT, right)) == 0, failure);  
++
++    // Cleanup
++    snd_mixer_selem_id_free(selem_id);
++
++    // Success
++    openxt_debug("setting volume: left = %lld, right = %lld\n", left, right);
++    return 0;
++
++failure:
++
++    // Cleanup
++    if (selem_id != NULL)
++        snd_mixer_selem_id_free(selem_id);
++
++    // Safety
++    openxt_alsa_mixer_fini(settings);
++
++    // Failure
++    openxt_error("failed to set the volume: %d - %s\n", ret, snd_strerror(ret));
++    return -1;
++}
++
++////////////////////////////////////////////////////////////////////////////////
++// Playback Functions                                                         //
++////////////////////////////////////////////////////////////////////////////////
++
++static int openxt_process_playback_init(void)
++{
++    int ret;
++
++    // QEMU should have sent us the settings that it would like us to use 
++    // when configuring ALSA. 
++    playback_settings.fmt = init_playback_packet->fmt;
++    playback_settings.freq = init_playback_packet->freq;
++    playback_settings.nchannels = init_playback_packet->nchannels;
++    playback_settings.sample_size = init_playback_packet->sample_size;
++
++    // Set the valid bit
++    playback_settings.valid = 1;
++    playback_settings.valid &= (openxt_alsa_init(&playback_settings, pcm_name_out, SND_PCM_STREAM_PLAYBACK) == 0) ? 1 : 0;
++    playback_settings.valid &= (openxt_alsa_mixer_init(&playback_settings) == 0) ? 1 : 0;
++
++    // Setup the ack packet
++    openxt_assert((ret = openxt_v4v_set_opcode(&snd_packet, OPENXT_INIT_PLAYBACK_ACK)) == 0, ret);
++    openxt_assert((ret = openxt_v4v_set_length(&snd_packet, sizeof(OpenXTInitPlaybackAckPacket))) == 0, ret);
++
++    // Setup the ack body that will be sent back to QEMU. Specifically we need to 
++    // tell QEMU what frequency we are actually running at, as well as 
++    // if ALSA was actually configured
++    init_playback_ack_packet->freq = playback_settings.freq;
++    init_playback_ack_packet->valid = playback_settings.valid;
++
++    // Send the ack. 
++    openxt_assert((ret = openxt_v4v_send(conn, &snd_packet)) == sizeof(OpenXTInitPlaybackAckPacket), ret);
++
++    // Success
++    return 0;
++}
++
++static int openxt_process_playback_fini(void)
++{
++    openxt_alsa_mixer_fini(&playback_settings);
++    openxt_alsa_fini(&playback_settings);
++
++    return 0;
++}
++
++static int openxt_process_get_available(void)
++{
++    int ret;
++
++    // Setup the packet. 
++    openxt_assert((ret = openxt_v4v_set_opcode(&snd_packet, OPENXT_PLAYBACK_ACK)) == 0, ret);
++    openxt_assert((ret = openxt_v4v_set_length(&snd_packet, sizeof(OpenXTGetAvailableAckPacket))) == 0, ret);
++
++    // Fill in the packet's contents. 
++    get_available_ack_packet->available = openxt_alsa_get_available(&playback_settings);
++
++    // Send the packet. 
++    openxt_assert((ret = openxt_v4v_send(conn, &snd_packet)) == sizeof(OpenXTGetAvailableAckPacket), ret);
++
++    // Success
++    return 0;
++}
++
++static int openxt_process_playback(void)
++{
++    openxt_alsa_writei(&playback_settings, playback_packet->samples, playback_packet->num_samples, MAX_PCM_BUFFER_SIZE);
++
++    return 0;
++}
++
++static int openxt_process_enable_voice(void)
++{
++    openxt_alsa_prepare(&playback_settings);
++
++    return 0;
++}
++
++static int openxt_process_disable_voice(void)
++{
++    openxt_alsa_drop(&playback_settings);
++
++    return 0;
++}
++
++static int openxt_process_set_volume(void)
++{
++    openxt_alsa_set_playback_volume(&playback_settings, set_volume_packet->left, set_volume_packet->right);
++
++    return 0;
++}
++
++////////////////////////////////////////////////////////////////////////////////
++// Main                                                                       //
++////////////////////////////////////////////////////////////////////////////////
++
++int main (int argc, char *argv[])
++{
++    // Local variables
++    int32_t opcode = 0;
++    int32_t stubdomid = 0;
++
++    openxt_debug_init();
++
++    // Make sure that we have the right number of arguments. 
++    if (argc != 2 && argc != 3) {
++       openxt_warn("wrong syntax: should be ./audio_helper <stubdom_id>\n");
++        exit(-EINVAL);
++    }
++
++    // Get the stubdomain's id
++    stubdomid = atoi(argv[1]);
++
++    // Set the ALSA device names. These device names exist inside of the 
++    // ALSA configuration file, so we need to make sure that they match. To 
++    // see where these are being set, look at the audio_helper_start script.
++    sprintf(pcm_name_in, "dsnoop0");
++    sprintf(pcm_name_out, "plug:vm-%d", stubdomid - 1);
++    sprintf(volume_control, "vm-%d", stubdomid - 1);
++
++    // Check to see if unit testing is turned on. If it is, we run the unit 
++    // test instead.
++    if (argc == 3) {
++        test_run();
++        exit(0);
++    }
++
++    // Default playback settings (in case of an error)
++    memset(&playback_settings, 0, sizeof(playback_settings));
++    memset(&capture_settings, 0, sizeof(capture_settings));
++
++    // Cleanup memory (safety)
++    memset(&snd_packet, 0, sizeof(V4VPacket));
++    memset(&rcv_packet, 0, sizeof(V4VPacket));
++
++    // Pointer checks
++    openxt_checkp(playback_packet = openxt_v4v_get_body(&rcv_packet), -EINVAL);
++    openxt_checkp(set_volume_packet = openxt_v4v_get_body(&rcv_packet), -EINVAL);
++    openxt_checkp(playback_ack_packet = openxt_v4v_get_body(&snd_packet), -EINVAL);
++    openxt_checkp(init_playback_packet = openxt_v4v_get_body(&rcv_packet), -EINVAL);
++    openxt_checkp(init_playback_ack_packet = openxt_v4v_get_body(&snd_packet), -EINVAL);
++    openxt_checkp(get_available_ack_packet = openxt_v4v_get_body(&snd_packet), -EINVAL);
++
++    // Size checks
++    openxt_assert(openxt_v4v_validate(sizeof(OpenXTPlaybackPacket)) == true, -EINVAL);
++    openxt_assert(openxt_v4v_validate(sizeof(OpenXTSetVolumePacket)) == true, -EINVAL);
++    openxt_assert(openxt_v4v_validate(sizeof(OpenXTPlaybackAckPacket)) == true, -EINVAL);
++    openxt_assert(openxt_v4v_validate(sizeof(OpenXTInitPlaybackPacket)) == true, -EINVAL);
++    openxt_assert(openxt_v4v_validate(sizeof(OpenXTInitPlaybackAckPacket)) == true, -EINVAL);
++    openxt_assert(openxt_v4v_validate(sizeof(OpenXTGetAvailableAckPacket)) == true, -EINVAL);
++
++    // Setup V4V
++    openxt_assert((conn = openxt_v4v_open(OPENXT_AUDIO_PORT, V4V_DOMID_ANY, V4V_PORT_NONE, stubdomid)) != NULL, -EINVAL);
++
++    // Process incoming commands from QEMU in the stubdomain. Once we get a 
++    // "fini" command from QEMU, we know that we can stop executing. 
++   while (opcode != OPENXT_FINI) {
++
++        int ret;
++
++        // Wait for a packet to come in from V4V
++       openxt_assert((ret = openxt_v4v_recv(conn, &rcv_packet)) >= 0, ret);
++
++        // Process the packet
++       switch(opcode = openxt_v4v_get_opcode(&rcv_packet)) {
++
++            case OPENXT_FINI:
++                break;
++
++            case OPENXT_INIT_PLAYBACK:
++                openxt_assert((ret = openxt_process_playback_init()) == 0, ret);
++                break;
++
++            case OPENXT_FINI_PLAYBACK:
++                openxt_assert((ret = openxt_process_playback_fini()) == 0, ret);
++                break;
++
++            case OPENXT_GET_AVAILABLE:
++                openxt_assert((ret = openxt_process_get_available()) == 0, ret);
++                break;      
++
++            case OPENXT_PLAYBACK:
++                openxt_assert((ret = openxt_process_playback()) == 0, ret);
++                break;  
++
++            case OPENXT_ENABLE_VOICE:
++                openxt_assert((ret = openxt_process_enable_voice()) == 0, ret);
++                break;  
++
++            case OPENXT_DISABLE_VOICE:
++                openxt_assert((ret = openxt_process_disable_voice()) == 0, ret);
++                break;  
++
++            case OPENXT_SET_VOLUME:
++                openxt_assert((ret = openxt_process_set_volume()) == 0, ret);
++                break;      
++
++            default:
++                openxt_warn("unknown packet opcode: %d\n", opcode);
++                exit(-EINVAL);
++       }
++   }
++
++    // Safely shutdown ALSA mixer
++    openxt_alsa_mixer_fini(&playback_settings);
++
++    // Safely shutdown ALSA
++    openxt_alsa_fini(&playback_settings);
++    openxt_alsa_fini(&capture_settings);
++
++    // No more need for debugging
++    openxt_info("safely shutdown\n");
++    openxt_debug_fini();
++
++    // Done
++    return 0;
++}
++
++
+diff -Naur xctools/audio_helper/src/openxtaudio.h xctools-audio-helper/audio_helper/src/openxtaudio.h
+--- xctools/audio_helper/src/openxtaudio.h  1969-12-31 19:00:00.000000000 -0500
++++ xctools-audio-helper/audio_helper/src/openxtaudio.h 2015-03-12 08:47:01.343146745 -0400
+@@ -0,0 +1,34 @@
++#ifndef AUDIO_HELPER_H
++#define AUDIO_HELPER_H
++
++#define ALSA_PCM_NEW_HW_PARAMS_API
++#include <alsa/asoundlib.h>
++
++#include <stdbool.h>
++#include <sys/types.h>
++
++typedef struct Settings {
++
++    snd_pcm_t *handle;
++    snd_mixer_t *mhandle;
++
++    int32_t fmt;
++    int32_t freq;
++    int32_t valid;
++    int32_t nchannels;
++    int32_t sample_size;
++
++} Settings;
++
++int openxt_alsa_remove_pcm(void);
++int openxt_alsa_mixer_fini(Settings *settings);
++int openxt_alsa_mixer_init(Settings *settings);
++int openxt_alsa_fini(Settings *settings);
++int openxt_alsa_init(Settings *settings, char *name, snd_pcm_stream_t stream);
++int openxt_alsa_prepare(Settings *settings);
++int openxt_alsa_drop(Settings *settings);
++int openxt_alsa_get_available(Settings *settings);
++int openxt_alsa_writei(Settings *settings, char *buffer, int32_t num, int32_t size);
++int openxt_alsa_set_playback_volume(Settings *settings, int64_t left, int64_t right);
++
++#endif // AUDIO_HELPER_H
+\ No newline at end of file
+diff -Naur xctools/audio_helper/src/openxtdebug.c xctools-audio-helper/audio_helper/src/openxtdebug.c
+--- xctools/audio_helper/src/openxtdebug.c  1969-12-31 19:00:00.000000000 -0500
++++ xctools-audio-helper/audio_helper/src/openxtdebug.c 2015-02-28 13:20:44.266142311 -0500
+@@ -0,0 +1,39 @@
++#include "openxtdebug.h"
++
++////////////////////////////////////////////////////////////////////////////////
++// Global Variables                                                           //
++////////////////////////////////////////////////////////////////////////////////
++
++bool debugging_enabled = false;
++
++////////////////////////////////////////////////////////////////////////////////
++// Functions                                                                  //
++////////////////////////////////////////////////////////////////////////////////
++
++inline void openxt_debug_init(void) 
++{
++#ifdef SYSLOG
++    openlog ("", LOG_CONS | LOG_PID | LOG_NDELAY, LOG_LOCAL1);
++#endif
++
++    openxt_debug_set_enabled(true);
++}
++
++inline void openxt_debug_fini(void) 
++{
++#ifdef SYSLOG
++    closelog ();
++#endif
++
++    openxt_debug_set_enabled(false);
++}
++
++bool openxt_debug_is_enabled(void)
++{
++    return debugging_enabled;
++}
++
++void openxt_debug_set_enabled(bool enabled)
++{
++    debugging_enabled = enabled;
++}
+diff -Naur xctools/audio_helper/src/openxtdebug.h xctools-audio-helper/audio_helper/src/openxtdebug.h
+--- xctools/audio_helper/src/openxtdebug.h  1969-12-31 19:00:00.000000000 -0500
++++ xctools-audio-helper/audio_helper/src/openxtdebug.h 2015-03-12 06:53:22.270970967 -0400
+@@ -0,0 +1,245 @@
++#ifndef OPENXT_DEBUG_H
++#define OPENXT_DEBUG_H
++
++#include <errno.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <stdbool.h>
++#include <sys/types.h>
++
++#include "openxtsettings.h"
++
++#ifdef SYSLOG
++#include <syslog.h>
++#include <stdlib.h>
++#else
++#include <stdio.h>
++#include <stdlib.h>
++#endif
++
++///
++/// Define TAG in your settings if you want a custom TAG provided in the debug
++/// statements
++///
++#ifndef TAG
++#define TAG ""
++#endif
++
++///
++/// This function can be used to tell the compiler that a variable is not used. 
++/// 
++/// @param a unused variable
++///
++#define openxt_unused(a) (void)a
++
++///
++/// The goal of this macro to provide a a simple debug statement that also 
++/// encapsulates syslog, so that things are reported to syslog if desired. 
++/// You should not use this directly, but instead use one of the openxt_
++/// macros. 
++///
++#ifdef SYSLOG
++    #define OPENXT_ERROR(...) \
++        fprintf(stderr, __VA_ARGS__); \
++        syslog(LOG_ERR, __VA_ARGS__)
++    #define OPENXT_DEBUG(...) \
++        fprintf(stdout, __VA_ARGS__); \
++        syslog(LOG_DEBUG, __VA_ARGS__)
++#else
++    #define OPENXT_ERROR(...) \
++        fprintf(stderr, __VA_ARGS__)
++    #define OPENXT_DEBUG(...) \
++        fprintf(stdout, __VA_ARGS__)
++#endif
++
++///
++/// This function can be used to validate that a pointer is not equal to NULL. 
++/// It takes a second, variable set of arguments that allows you to provide a 
++/// return value when the error occurs. If the function is a void, you can 
++/// remove the second argument, and the compiler will equate that to "return;"
++/// 
++/// @param a pointer to validate
++/// @param ... return value (for none void functions)
++///
++#define openxt_checkp(a,...) \
++    if ((a) == 0) { \
++        if (openxt_debug_is_enabled() == true) { \
++            OPENXT_ERROR("%s: ERROR: {%s} == NULL, line: %d, func: %s\n", TAG, #a, __LINE__, __PRETTY_FUNCTION__); \
++        } \
++        return __VA_ARGS__; \
++    }
++
++///
++/// This function can be used to validate that a pointer is not equal to NULL. 
++/// It takes a second, variable set of arguments that allows you to provide a 
++/// return value when the error occurs. If the function is a void, you can 
++/// remove the second argument, and the compiler will equate that to "return;"
++/// 
++/// @param a pointer to validate
++/// @param b goto label
++///
++#define openxt_checkp_goto(a,b) \
++    if ((a) == 0) { \
++        if (openxt_debug_is_enabled() == true) { \
++            OPENXT_ERROR("%s: ERROR: {%s} == NULL, line: %d, func: %s\n", TAG, #a, __LINE__, __PRETTY_FUNCTION__); \
++        } \
++        goto b; \
++    }
++
++///
++/// This is an assert, with a return. Most asserts are removed in "production"
++/// but this version is not. This macro (or it's alternatives) will likely be 
++/// used a lot as it makes sure that what you are calling executed correctly. 
++/// Use this to validate that a function executed correctly, or use it to 
++/// validate that a variable has an expected value. The goal is to use this 
++/// macro enough such that, if an error occurs, the function gracefully exits
++/// before something really bad happens. 
++/// 
++/// @param a the expression to validate
++/// @param ... return value (for none void functions)
++///
++#define openxt_assert(a,...) \
++    if (!(a)) { \
++        if (openxt_debug_is_enabled() == true) { \
++            OPENXT_ERROR("%s: ERROR: {%s} == false, line: %d, func: %s\n", TAG, #a, __LINE__, __PRETTY_FUNCTION__); \
++        } \
++        return __VA_ARGS__; \
++    }
++
++///
++/// This is an assert, with a goto. Most asserts are removed in "production"
++/// but this version is not. This macro (or it's alternatives) will likely be 
++/// used a lot as it makes sure that what you are calling executed correctly. 
++/// Use this to validate that a function executed correctly, or use it to 
++/// validate that a variable has an expected value. The goal is to use this 
++/// macro enough such that, if an error occurs, the function gracefully exits
++/// before something really bad happens. 
++/// 
++/// @param a the expression to validate
++/// @param b goto label
++///
++#define openxt_assert_goto(a,b) \
++    if (!(a)) { \
++        if (openxt_debug_is_enabled() == true) { \
++            OPENXT_ERROR("%s: ERROR: {%s} == false, line: %d, func: %s\n", TAG, #a, __LINE__, __PRETTY_FUNCTION__); \
++        } \
++        goto b; \
++    }
++
++///
++/// This is an assert, with a return. Most asserts are removed in "production"
++/// but this version is not. This macro (or it's alternatives) will likely be 
++/// used a lot as it makes sure that what you are calling executed correctly. 
++/// Use this to validate that a function executed correctly, or use it to 
++/// validate that a variable has an expected value. The goal is to use this 
++/// macro enough such that, if an error occurs, the function gracefully exits
++/// before something really bad happens. 
++/// 
++/// @param a the expression to validate
++/// @param b linux error code (can either be ret, or errno)
++/// @param ... return value (for none void functions)
++///
++#define openxt_assert_ret(a,b,...) \
++    if (!(a)) { \
++        if (openxt_debug_is_enabled() == true) { \
++            OPENXT_ERROR("%s: ERROR: {%s} == false, error: %d, srterror: %s, line: %d, func: %s\n", TAG, #a, b, strerror(b), __LINE__, __PRETTY_FUNCTION__); \
++        } \
++        return __VA_ARGS__; \
++    }
++
++///
++/// This is an assert, with a return. Most asserts are removed in "production"
++/// but this version is not. This macro (or it's alternatives) will likely be 
++/// used a lot as it makes sure that what you are calling executed correctly. 
++/// Use this to validate that a function executed correctly, or use it to 
++/// validate that a variable has an expected value. The goal is to use this 
++/// macro enough such that, if an error occurs, the function gracefully exits
++/// before something really bad happens. 
++/// 
++/// @param a the expression to validate
++/// @param ... return value (for none void functions)
++///
++#define openxt_assert_quiet(a,...) \
++    if (!(a)) { \
++        return __VA_ARGS__; \
++    }
++
++///
++/// This function provide a wrapped printf (info). You can also define SYSLOG 
++/// in your settings file, and the functionality will convert to using 
++/// syslog instead of using printf. Use these functions just like 
++/// printf. 
++///
++#ifdef DEBUGGING_ENABLED
++#define openxt_info(...) \
++    if (openxt_debug_is_enabled() == true) { \
++        OPENXT_ERROR(TAG ": INFO: " __VA_ARGS__); \
++    }
++#else
++#define openxt_info(...)
++#endif
++
++///
++/// This function provide a wrapped printf (warn). You can also define SYSLOG 
++/// in your settings file, and the functionality will convert to using 
++/// syslog instead of using printf. Use these functions just like 
++/// printf. 
++///
++#define openxt_warn(...) \
++    if (openxt_debug_is_enabled() == true) { \
++        OPENXT_ERROR(TAG ": WARNING: " __VA_ARGS__); \
++    }
++
++///
++/// This function provide a wrapped printf (error). You can also define SYSLOG 
++/// in your settings file, and the functionality will convert to using 
++/// syslog instead of using printf. Use these functions just like 
++/// printf. 
++///
++#define openxt_error(...) \
++    if (openxt_debug_is_enabled() == true) { \
++        OPENXT_ERROR(TAG ": ERROR: " __VA_ARGS__); \
++    }
++
++///
++/// This function provide a wrapped printf (error). You can also define SYSLOG 
++/// in your settings file, and the functionality will convert to using 
++/// syslog instead of using printf. Use these functions just like 
++/// printf. 
++///
++#define openxt_debug(...) \
++        OPENXT_ERROR(TAG ": DEBUG: " __VA_ARGS__); \
++
++///
++/// Helpful for debugging issues
++///
++#define openxt_line openxt_info("file: %s, line: %d\n", __FILE__, __LINE__);
++
++///
++/// This should be the first thing your run in your program. This initializes 
++/// debugging
++///
++void openxt_debug_init(void);
++
++///
++/// This should be the last thing your program does. This cleans up debugging. 
++///
++void openxt_debug_fini(void);
++
++///
++/// The following tells the debug statements where or not debugging is 
++/// turned on
++///
++/// @return true = debugging is enabled
++///
++bool openxt_debug_is_enabled(void);
++
++/// 
++/// The following enables / disables debugging
++/// 
++/// @param enabled true = turn on debug messages
++/// 
++void openxt_debug_set_enabled(bool enabled);
++
++#endif // OPENXT_DEBUG_H
+diff -Naur xctools/audio_helper/src/openxtpackets.h xctools-audio-helper/audio_helper/src/openxtpackets.h
+--- xctools/audio_helper/src/openxtpackets.h    1969-12-31 19:00:00.000000000 -0500
++++ xctools-audio-helper/audio_helper/src/openxtpackets.h   2015-03-11 22:12:57.062176376 -0400
+@@ -0,0 +1,86 @@
++#ifndef OPENXT_PACKETS_H
++#define OPENXT_PACKETS_H
++
++#include "openxtsettings.h"
++
++typedef enum PacketOpCode {
++
++    // Global
++    OPENXT_FINI                 = 01, 
++
++    // Init Commands
++    OPENXT_INIT_PLAYBACK        = 10,
++    OPENXT_INIT_PLAYBACK_ACK    = 11,
++    OPENXT_INIT_CAPTURE         = 12,
++    OPENXT_INIT_CAPTURE_ACK     = 13,
++
++    // Fini Commands
++    OPENXT_FINI_PLAYBACK        = 20,
++    OPENXT_FINI_CAPTURE         = 21,
++
++    // Available
++    OPENXT_GET_AVAILABLE        = 30,
++    OPENXT_GET_AVAILABLE_ACK    = 31,
++
++    // Control 
++    OPENXT_ENABLE_VOICE         = 40,  
++    OPENXT_DISABLE_VOICE        = 41,  
++    OPENXT_SET_VOLUME           = 42,
++
++    // Process
++    OPENXT_PLAYBACK             = 50,
++    OPENXT_CAPTURE              = 51,
++    OPENXT_PLAYBACK_ACK         = 52,
++    OPENXT_CAPTURE_ACK          = 53,
++
++} PacketOpCode;
++
++typedef struct OpenBlankPacket {
++
++} OpenBlankPacket;
++
++typedef struct OpenXTInitPlaybackPacket {
++
++    int32_t fmt;
++    int32_t freq;
++    int32_t nchannels;
++    int32_t sample_size;
++
++} OpenXTInitPlaybackPacket;
++
++typedef struct OpenXTInitPlaybackAckPacket {
++
++    int32_t freq;
++    int32_t valid;
++
++} OpenXTInitPlaybackAckPacket;
++
++typedef struct OpenXTGetAvailableAckPacket {
++
++    int32_t available;
++
++} OpenXTGetAvailableAckPacket;
++
++typedef struct OpenXTPlaybackPacket {
++
++    int32_t num_samples;
++    char samples[MAX_PCM_BUFFER_SIZE];
++
++} OpenXTPlaybackPacket;
++
++typedef struct OpenXTPlaybackAckPacket {
++
++    int32_t written;
++
++} OpenXTPlaybackAckPacket;
++
++typedef struct OpenXTSetVolumePacket {
++
++    int64_t left;
++    int64_t right;
++
++} OpenXTSetVolumePacket;
++
++#define PLAYBACK_PACKET_LENGTH(a,b) (sizeof(int32_t) + (a * b))
++
++#endif // OPENXT_PACKETS_H
+diff -Naur xctools/audio_helper/src/openxtsettings.h xctools-audio-helper/audio_helper/src/openxtsettings.h
+--- xctools/audio_helper/src/openxtsettings.h   1969-12-31 19:00:00.000000000 -0500
++++ xctools-audio-helper/audio_helper/src/openxtsettings.h  2015-03-07 21:44:19.334377541 -0500
+@@ -0,0 +1,17 @@
++#ifndef OPENXT_SETTINGS
++#define OPENXT_SETTINGS
++
++#define SYSLOG
++#define DEBUGGING_ENABLED
++#define TAG "openxt_audio_back"
++
++// The following means that we should have room for roughly 1280 samples 
++#define MAX_PCM_BUFFER_SIZE (4096)
++
++// Define the maximum size of a V4V packet
++#define V4V_MAX_PACKET_BODY_SIZE (4096 * 2)
++
++// The following is the V4V port that we will use for communications. 
++#define OPENXT_AUDIO_PORT 5001
++
++#endif // OPENXT_SETTINGS
+\ No newline at end of file
+diff -Naur xctools/audio_helper/src/openxtv4v.c xctools-audio-helper/audio_helper/src/openxtv4v.c
+--- xctools/audio_helper/src/openxtv4v.c    1969-12-31 19:00:00.000000000 -0500
++++ xctools-audio-helper/audio_helper/src/openxtv4v.c   2015-03-07 23:52:15.826232908 -0500
+@@ -0,0 +1,358 @@
++#include "openxtv4v.h"
++#include "openxtdebug.h"
++
++///
++/// This is the main function to setup your V4V connection to another domain. 
++/// The following provides suggested arguments for this function:
++/// 
++/// Clients
++/// - local port = V4V_PORT_NONE
++/// - local domid = V4V_DOMID_ANY
++/// - remote port = <port #>
++/// - remote domid = <server domid, likely == 0>
++/// 
++/// Servers
++/// - local port = <port #>
++/// - local domid = V4V_DOMID_ANY
++/// - remote port = V4V_PORT_NONE
++/// - remote domid = <client domid>
++/// 
++/// @param localport local port
++/// @param localdomid local domid
++/// @param remoteport remote port
++/// @param remotedomid remote domid
++/// 
++/// @return NULL on failure, valid pointer on success
++///
++V4VConnection *openxt_v4v_open(int32_t localport, int32_t localdomid, int32_t remoteport, int32_t remotedomid)
++{
++    // Create a new connection structure
++    V4VConnection *conn = malloc(sizeof(V4VConnection));
++
++    // Initialize the connection for safety.
++    conn->fd = 0;
++    conn->connected = false;
++    conn->local_addr.port = localport;
++    conn->local_addr.domain = localdomid;
++    conn->remote_addr.port = remoteport;
++    conn->remote_addr.domain = remotedomid;
++
++    // Attempt to open a V4V socket
++    if((conn->fd = v4v_socket(SOCK_DGRAM)) <= 0)
++        goto done;
++
++    // Bind to V4V
++    if(v4v_bind(conn->fd, &conn->local_addr, conn->remote_addr.domain) != 0)
++        goto done;
++
++    // We are now connected
++    conn->connected = true;
++
++done:
++
++    // Success
++    return conn;
++}
++
++
++///
++/// The following is for internal use only.
++///
++int openxt_v4v_close_internal(V4VConnection *conn)
++{
++    int ret = 0;
++
++    // Sanity checks
++    openxt_checkp(conn, -EINVAL);
++
++    // Close V4V
++    if (conn->fd)
++        ret = v4v_close(conn->fd);
++
++    // We are no longer connected
++    conn->fd = 0;
++    conn->connected = false;
++
++    // Success
++    return ret;
++}
++
++
++///
++/// Once you are done with V4V, run this function. Note that this function 
++/// could be called by this API if something bad happens. 
++/// 
++/// Note that this free's conn, so don't call it twice :)
++/// 
++/// @return -EINVAL if conn == NULL,
++///          negative error code on failure of v4v_close, 
++///          0 on success
++///
++int openxt_v4v_close(V4VConnection *conn)
++{
++    int ret = openxt_v4v_close_internal(conn);
++
++    // Sanity checks
++    openxt_checkp(conn, -EINVAL);
++
++    // Cleanup
++    free(conn);
++
++    // Success
++    return ret;
++}
++
++///
++/// The following function will tell you if the V4V socket is open and 
++/// connected
++///
++/// @return true = connected, false = disconnected or conn == NULL
++///
++bool openxt_v4v_isconnected(V4VConnection *conn)
++{
++    // Sanity checks
++    openxt_checkp(conn, false);
++
++    // Return connection status
++    return conn->connected;
++}
++
++///
++/// The following can be used as a safety to make sure that your packets are 
++/// not bigger than a V4V packet. This way you can use the packet structures
++/// all you want later without fear of buffer overflows. 
++///
++/// @param size the size of your packet
++/// @return true = safe, false = unsafe (likely will overflow)
++///
++bool openxt_v4v_validate(int32_t size)
++{
++    return size <= V4V_MAX_PACKET_BODY_SIZE;
++}
++
++///
++/// The following will set the opcode of a packet. 
++///
++/// @param packet the packet that you want to set the opcode for
++/// @param opcode the opcode that you want to set
++/// 
++/// @return -EINVAL if packet == NULL, 0 on success
++///
++int openxt_v4v_set_opcode(V4VPacket *packet, int32_t opcode)
++{
++    // Sanity checks
++    openxt_checkp(packet, -EINVAL);
++
++    // Set the opcode of the packet
++    packet->header.opcode = opcode;
++
++    // Success
++    return 0;
++}
++
++///
++/// The following will set the length of a packet. 
++///
++/// @param packet the packet that you want to set the length for
++/// @param length the length that you want to set
++/// 
++/// @return -EINVAL if packet == NULL, -EOVERFLOW if the length is too large, 0 on success
++///
++int openxt_v4v_set_length(V4VPacket *packet, int32_t length)
++{
++    // Sanity checks
++    openxt_checkp(packet, -EINVAL);
++    openxt_assert(length <= V4V_MAX_PACKET_BODY_SIZE, -EOVERFLOW);
++
++    // Set the opcode of the packet
++    packet->header.length = length + sizeof(V4VPacketHeader);
++
++    // Success
++    return 0;
++}
++
++///
++/// The following will get the opcode of a packet. 
++///
++/// @param packet the packet that you want to get the opcode for
++/// 
++/// @return -EINVAL if packet == NULL, opcode on success
++///
++int openxt_v4v_get_opcode(V4VPacket *packet)
++{
++    // Sanity checks
++    openxt_checkp(packet, -EINVAL);
++
++    // Success
++    return packet->header.opcode;
++}
++
++///
++/// The following will get the length of a packet. 
++///
++/// @param packet the packet that you want to get the length for
++/// 
++/// @return -EINVAL if packet == NULL, length on success
++///
++int openxt_v4v_get_length(V4VPacket *packet)
++{
++    // Sanity checks
++    openxt_checkp(packet, -EINVAL);
++
++    // Success
++    return packet->header.length - sizeof(V4VPacketHeader);
++}
++
++///
++/// The following gets the body of a packet. This is basically where you would
++/// put the contents of your packet. 
++/// 
++/// @code
++/// 
++/// V4VPacket snd_packet;
++/// MyPacket *packet = openxt_v4v_get_body(&snd_packet);
++/// 
++/// packet->data1 = data1;
++/// packet->data2 = data2;
++/// 
++/// openxt_v4v_set_opcode(&snd_packet, opcode);
++/// openxt_v4v_set_length(&snd_packet, sizeof(MyPacket));
++/// 
++/// openxt_v4v_send(conn, &snd_packet);
++/// 
++/// @endcode
++/// 
++/// @param packet the packet that you want body access to
++/// @return NULL = packet == NULL, valid pointer on success
++///
++void *openxt_v4v_get_body(V4VPacket *packet)
++{
++    // Sanity checks
++    openxt_checkp(packet, NULL);
++
++    // Success
++    return packet->body.buffer;
++}
++
++///
++/// The following function will send a V4V packet. 
++///
++/// @param conn the V4V connection created using openxt_v4v_open. 
++/// @param packet the packet to send
++/// 
++/// @return -EINVAL if conn or packet == NULL, 
++///         -EOVERFLOW if the packet length is too large, 
++///         -ENODEV if conn is closed, 
++///          negative errno if v4v_sendto fails, 
++///          ret >= 0 on success representing number of bytes sent
++///
++int openxt_v4v_send(V4VConnection *conn, V4VPacket *packet)
++{
++    // Local variables
++    int ret;
++
++    // Sanity checks
++    openxt_checkp(conn, -EINVAL);
++    openxt_checkp(packet, -EINVAL);
++    openxt_assert(openxt_v4v_get_length(packet) <= V4V_MAX_PACKET_BODY_SIZE, -EOVERFLOW);
++
++    // Make sure that we are actually connected. Note that we make this a 
++    // quite failure because if a problem happens, we will close the connection
++    // and it's possible that the code might continue attempting to send, and 
++    // we do not want to kill performance by logging a ton of error messages
++    openxt_assert_quiet(openxt_v4v_isconnected(conn) == true, -ENODEV);
++
++    // Send the packet. Note that we handle printing useful error messages
++    // here. All the user should have to do, is validate that the send was 
++    // successful
++    if ((ret = v4v_sendto(conn->fd, (char *)packet, packet->header.length, 0, &conn->remote_addr)) <= 0) {
++
++        switch (ret) {
++        
++            // Failed to send anything
++            case 0:
++            {
++                openxt_warn("failed openxt_v4v_send, wrote 0 bytes: %d - %s\n", errno, strerror(errno));
++                openxt_v4v_close_internal(conn);
++                return -errno;
++            }
++
++            // Error
++            default:
++            {
++                openxt_warn("failed openxt_v4v_send: %d - %s\n", errno, strerror(errno));
++                openxt_v4v_close_internal(conn);
++                return -errno;
++            }
++        }
++    }
++
++    // Success
++    return ret - sizeof(V4VPacketHeader);
++}
++
++///
++/// The following function will send a V4V packet. 
++///
++/// @param conn the V4V connection created using openxt_v4v_open. 
++/// @param packet the packet to send
++/// 
++/// @return -EINVAL if conn or packet == NULL, 
++///         -EIO if the received packet length != length in header, 
++///         -ENODEV if conn is closed, 
++///          negative errno if v4v_recvfrom fails, 
++///          ret >= 0 on success representing number of bytes received
++///
++int openxt_v4v_recv(V4VConnection *conn, V4VPacket *packet)
++{
++    // Local variables
++    int ret;
++
++    // Sanity checks
++    openxt_checkp(conn, -EINVAL);
++    openxt_checkp(packet, -EINVAL);
++
++    // Make sure that we are actually connected. Note that we make this a 
++    // quite failure because if a problem happens, we will close the connection
++    // and it's possible that the code might continue attempting to send, and 
++    // we do not want to kill performance by logging a ton of error messages
++    openxt_assert_quiet(openxt_v4v_isconnected(conn) == true, -ENODEV);
++
++    // Send the packet. Note that we handle printing useful error messages
++    // here. All the user should have to do, is validate that the send was 
++    // successful
++    if ((ret = v4v_recvfrom(conn->fd, (char *)packet, sizeof(V4VPacket), 0, &conn->remote_addr)) <= 0) {
++
++        switch (ret) {
++        
++            // Failed to receive anything
++            case 0:
++            {
++                openxt_warn("failed openxt_v4v_recv, read 0 bytes: %d - %s\n", errno, strerror(errno));
++                openxt_v4v_close_internal(conn);
++                return -errno;
++            }
++
++            // Error
++            default:
++            {
++                openxt_warn("failed openxt_v4v_recv: %d - %s\n", errno, strerror(errno));
++                openxt_v4v_close_internal(conn);
++                return -errno;
++            }
++        }
++    }
++
++    // Before we return the packet, we need to check to make sure that the 
++    // amount of data that we read, is equal to the amount of data that the 
++    // packet should have returned. If it is not, we have an error
++    if (packet->header.length != ret) {
++
++        openxt_warn("failed openxt_v4v_recv: length mismatch %d - %d\n", packet->header.length, ret);
++        openxt_v4v_close_internal(conn);
++        return -EIO;
++    }
++    
++    // Success
++    return ret - sizeof(V4VPacketHeader);
++}
+diff -Naur xctools/audio_helper/src/openxtv4v.h xctools-audio-helper/audio_helper/src/openxtv4v.h
+--- xctools/audio_helper/src/openxtv4v.h    1969-12-31 19:00:00.000000000 -0500
++++ xctools-audio-helper/audio_helper/src/openxtv4v.h   2015-03-08 00:19:54.218225930 -0500
+@@ -0,0 +1,56 @@
++#ifndef OPENXT_V4V_H
++#define OPENXT_V4V_H
++
++#include <libv4v.h>
++#include <stdbool.h>
++#include <sys/types.h>
++#include <sys/ioctl.h>
++
++#include "openxtsettings.h"
++
++typedef struct V4VConnection {
++
++    int fd;
++    bool connected;
++    v4v_addr_t local_addr;
++    v4v_addr_t remote_addr;
++
++} V4VConnection;
++
++V4VConnection *openxt_v4v_open(int32_t localport, int32_t localdomid, int32_t remoteport, int32_t remotedomid);
++int openxt_v4v_close_internal(V4VConnection *conn);
++int openxt_v4v_close(V4VConnection *conn);
++bool openxt_v4v_isconnected(V4VConnection *conn);
++
++typedef struct V4VPacketHeader {
++
++    int32_t opcode;
++    int32_t length;
++
++} V4VPacketHeader;
++
++typedef struct V4VPacketBody {
++
++    char buffer[V4V_MAX_PACKET_BODY_SIZE];
++
++} V4VPacketBody;
++
++typedef struct V4VPacket {
++
++    V4VPacketHeader header;
++    V4VPacketBody body;
++
++} V4VPacket;
++
++bool openxt_v4v_validate(int32_t size);
++
++int openxt_v4v_set_opcode(V4VPacket *packet, int32_t opcode);
++int openxt_v4v_set_length(V4VPacket *packet, int32_t length);
++int32_t openxt_v4v_get_opcode(V4VPacket *packet);
++int32_t openxt_v4v_get_length(V4VPacket *packet);
++void *openxt_v4v_get_body(V4VPacket *packet);
++
++int openxt_v4v_send(V4VConnection *conn, V4VPacket *packet);
++int openxt_v4v_recv(V4VConnection *conn, V4VPacket *packet);
++
++#endif // OPENXT_V4V_H
+diff -Naur xctools/audio_helper/src/unittest.c xctools-audio-helper/audio_helper/src/unittest.c
+--- xctools/audio_helper/src/unittest.c 1969-12-31 19:00:00.000000000 -0500
++++ xctools-audio-helper/audio_helper/src/unittest.c    2015-03-12 09:43:34.219231943 -0400
+@@ -0,0 +1,210 @@
++#include "unittest.h"
++
++#include "openxtv4v.h"
++#include "openxtdebug.h"
++#include "openxtaudio.h"
++
++////////////////////////////////////////////////////////////////////////////////
++// Global Variables                                                           //
++////////////////////////////////////////////////////////////////////////////////
++
++int32_t pass = 0;
++int32_t fail = 0;
++
++////////////////////////////////////////////////////////////////////////////////
++// Tests                                                                      //
++////////////////////////////////////////////////////////////////////////////////
++
++typedef struct TestPacket {
++
++    int32_t data1;
++    int32_t data2;
++
++} TestPacket;
++
++void test_v4v(void)
++{
++    V4VConnection *client = NULL;
++    V4VConnection *server = NULL;
++
++    // Packets
++    V4VPacket snd_packet;
++    V4VPacket rcv_packet;
++    TestPacket *snd_packet_body = NULL;
++    TestPacket *rcv_packet_body = NULL;
++
++    // Start from zero.
++    memset(&snd_packet, 0, sizeof(snd_packet));
++    memset(&rcv_packet, 0, sizeof(rcv_packet));
++
++    // TODO: The following still needs testing:
++    // 
++    // - I currently am not testing invalid arguments to openxt_v4v_open. This 
++    //   one is hard as V4V doesn't really check things on it's own
++
++    // Make sure the validate function works
++    UT_CHECK(openxt_v4v_validate(sizeof(TestPacket)) == true);
++    UT_CHECK(openxt_v4v_validate(V4V_MAX_PACKET_BODY_SIZE * 2) == false);
++
++    // Make sure that we hit the correct errors
++    UT_CHECK(openxt_v4v_isconnected(NULL) == false);
++    UT_CHECK(openxt_v4v_isconnected(NULL) == false);
++
++    // We should not be connected
++    UT_CHECK(openxt_v4v_isconnected(client) == false);
++    UT_CHECK(openxt_v4v_isconnected(server) == false);
++
++    // Valid setup
++    UT_CHECK((client = openxt_v4v_open(V4V_PORT_NONE, V4V_DOMID_ANY, 5001, 0)) != NULL);
++    UT_CHECK((server = openxt_v4v_open(5001, V4V_DOMID_ANY, V4V_PORT_NONE, 0)) != NULL);
++
++    // Make sure that we are connected
++    UT_CHECK(openxt_v4v_isconnected(client) == true);
++    UT_CHECK(openxt_v4v_isconnected(server) == true);
++
++    // Make sure that we hit the correct errors
++    UT_CHECK(openxt_v4v_close(NULL) == -EINVAL);
++    UT_CHECK(openxt_v4v_close(NULL) == -EINVAL);
++
++    // Make sure that we can close the connection
++    UT_CHECK(openxt_v4v_close(client) == 0);
++    UT_CHECK(openxt_v4v_close(server) == 0);
++
++    // Setup again
++    UT_CHECK((client = openxt_v4v_open(V4V_PORT_NONE, V4V_DOMID_ANY, 5001, 0)) != NULL);
++    UT_CHECK((server = openxt_v4v_open(5001, V4V_DOMID_ANY, V4V_PORT_NONE, 0)) != NULL);
++
++    // Make sure that we hit the correct errors
++    UT_CHECK(openxt_v4v_set_opcode(NULL, 0) == -EINVAL);
++    UT_CHECK(openxt_v4v_set_length(NULL, 0) == -EINVAL);
++    UT_CHECK(openxt_v4v_set_length(&snd_packet, V4V_MAX_PACKET_BODY_SIZE * 2) == -EOVERFLOW);
++
++    // Set the length and opcode
++    UT_CHECK(openxt_v4v_set_opcode(&snd_packet, 5) == 0);
++    UT_CHECK(openxt_v4v_set_opcode(&rcv_packet, 5) == 0);
++    UT_CHECK(openxt_v4v_set_length(&snd_packet, sizeof(TestPacket)) == 0);
++    UT_CHECK(openxt_v4v_set_length(&rcv_packet, sizeof(TestPacket)) == 0);
++
++    // Make sure that we hit the correct errors
++    UT_CHECK(openxt_v4v_get_opcode(NULL) == -EINVAL);
++    UT_CHECK(openxt_v4v_get_length(NULL) == -EINVAL);
++
++    // Set the length and opcode
++    UT_CHECK(openxt_v4v_get_opcode(&snd_packet) == 5);
++    UT_CHECK(openxt_v4v_get_opcode(&rcv_packet) == 5);
++    UT_CHECK(openxt_v4v_get_length(&snd_packet) == sizeof(TestPacket));
++    UT_CHECK(openxt_v4v_get_length(&rcv_packet) == sizeof(TestPacket));
++
++    // Make sure that we hit the correct errors
++    UT_CHECK((snd_packet_body = openxt_v4v_get_body(NULL)) == NULL);    
++    UT_CHECK((rcv_packet_body = openxt_v4v_get_body(NULL)) == NULL);    
++
++    // Make sure that we get valid pointers
++    UT_CHECK((snd_packet_body = openxt_v4v_get_body(&snd_packet)) != NULL);    
++    UT_CHECK((rcv_packet_body = openxt_v4v_get_body(&rcv_packet)) != NULL);    
++
++    // Put data into the packets
++    if (snd_packet_body && rcv_packet_body)
++    {
++        snd_packet_body->data1 = 1;
++        snd_packet_body->data2 = 2;
++
++        // Make sure that we hit the correct errors
++        UT_CHECK(openxt_v4v_send(NULL, &snd_packet) == -EINVAL);
++        UT_CHECK(openxt_v4v_recv(NULL, &rcv_packet) == -EINVAL);
++        UT_CHECK(openxt_v4v_send(client, NULL) == -EINVAL);
++        UT_CHECK(openxt_v4v_recv(server, NULL) == -EINVAL);
++
++        // Mess up the connection
++        UT_CHECK(openxt_v4v_close_internal(client) == 0);
++        UT_CHECK(openxt_v4v_close_internal(server) == 0);
++
++        // Make sure that we hit the correct errors
++        UT_CHECK(openxt_v4v_send(client, &snd_packet) == -ENODEV);
++        UT_CHECK(openxt_v4v_recv(server, &rcv_packet) == -ENODEV);
++
++        // Mess up the length
++        snd_packet.header.length = V4V_MAX_PACKET_BODY_SIZE * 2;
++        rcv_packet.header.length = V4V_MAX_PACKET_BODY_SIZE * 2;
++
++        // Make sure that we hit the correct errors
++        UT_CHECK(openxt_v4v_send(client, &snd_packet) == -EOVERFLOW);
++
++        // Clean things up
++        UT_CHECK(openxt_v4v_close(client) == 0);
++        UT_CHECK(openxt_v4v_close(server) == 0);
++        UT_CHECK((client = openxt_v4v_open(V4V_PORT_NONE, V4V_DOMID_ANY, 5001, 0)) != NULL);
++        UT_CHECK((server = openxt_v4v_open(5001, V4V_DOMID_ANY, V4V_PORT_NONE, 0)) != NULL);
++        UT_CHECK(openxt_v4v_set_length(&snd_packet, sizeof(TestPacket)) == 0);
++        UT_CHECK(openxt_v4v_set_length(&rcv_packet, sizeof(TestPacket)) == 0);
++
++        // Validate that you can send / recv correctly.
++        UT_CHECK(openxt_v4v_send(client, &snd_packet) == sizeof(TestPacket));
++        UT_CHECK(openxt_v4v_recv(server, &rcv_packet) == sizeof(TestPacket));
++
++        // Validate the result
++        UT_CHECK(rcv_packet_body->data1 == 1);
++        UT_CHECK(rcv_packet_body->data2 == 2);
++    }
++}
++
++void test_alsa(void)
++{
++    Settings settings;
++    settings.fmt = SND_PCM_FORMAT_S16_LE;
++    settings.freq = 44100;
++    settings.nchannels = 2;
++    settings.sample_size = 16;
++
++    UT_CHECK(openxt_alsa_mixer_init(&settings) == 0);
++    UT_CHECK(openxt_alsa_mixer_init(&settings) == 0);
++    UT_CHECK(openxt_alsa_mixer_fini(&settings) == 0);
++    UT_CHECK(openxt_alsa_mixer_fini(&settings) == 0);
++
++    UT_CHECK(openxt_alsa_mixer_init(&settings) == 0);
++    UT_CHECK(openxt_alsa_set_playback_volume(&settings, -1, -1) == -EINVAL);
++    UT_CHECK(openxt_alsa_mixer_init(&settings) == 0);
++    UT_CHECK(openxt_alsa_set_playback_volume(&settings, 256, 256) == -EINVAL);
++
++    UT_CHECK(openxt_alsa_mixer_init(&settings) == 0);
++    UT_CHECK(openxt_alsa_set_playback_volume(&settings, 0, 0) == 0);
++    UT_CHECK(openxt_alsa_set_playback_volume(&settings, 255, 255) == 0);
++    UT_CHECK(openxt_alsa_mixer_fini(&settings) == 0);
++}
++
++
++////////////////////////////////////////////////////////////////////////////////
++// Support                                                                    //
++////////////////////////////////////////////////////////////////////////////////
++
++bool unittest = false;
++
++bool is_unittest(void)
++{
++    return unittest;
++}
++
++void test_run(void)
++{
++    unittest = true;
++    openxt_debug_set_enabled(false);
++
++    // Header
++    openxt_info("--------------------------------------------\n");
++    openxt_info("- Unit Tests                               -\n");
++    openxt_info("--------------------------------------------\n");
++    openxt_info("\n");
++
++    // Tests
++    test_v4v();
++    test_alsa();
++
++    // Footer
++    openxt_info("\n");
++    openxt_info("\n");
++    openxt_info("passed: %d\n", pass);
++    openxt_info("failed: %d\n", fail);
++    openxt_info("\n");
++
++    openxt_debug_set_enabled(true);
++}
+diff -Naur xctools/audio_helper/src/unittest.h xctools-audio-helper/audio_helper/src/unittest.h
+--- xctools/audio_helper/src/unittest.h 1969-12-31 19:00:00.000000000 -0500
++++ xctools-audio-helper/audio_helper/src/unittest.h    2015-03-12 08:42:40.815139618 -0400
+@@ -0,0 +1,37 @@
++#ifndef UNITTEST_H
++#define UNITTEST_H
++
++#include <stdbool.h>
++#include <sys/types.h>
++
++///
++/// The following can be used to validate a test. Note that this can only be 
++/// used inside the unittest.c as it relies on global variables for some 
++/// stats. 
++///
++#define UT_CHECK(a) \
++    { \
++        if ((a)) { \
++            openxt_debug("    %s%04d%-20s%s\n", "test (", __LINE__, "): ", "[pass]"); \
++            pass++; \
++        } else { \
++            openxt_debug("--> %s%04d%-20s%s\n", "test (", __LINE__, "): ", "[fail] <--"); \
++            fail++; \
++        } \
++    }
++
++// 
++// The following can be used to figure out if the code is being execute under
++// a unit test. This is useful for turning off functionality that cannot be 
++// tested easily. 
++// 
++bool is_unittest(void);
++
++///
++/// This is the main function that runs the tests. If you add tests to this 
++/// unit test, create a function(s) for your tests, and then add the 
++/// function(s) into this function so that it can be run, if needed. 
++///
++void test_run(void);
++
++#endif // UNITTEST_H
+\ No newline at end of file
+diff -Naur xctools/audio_helper/version-files xctools-audio-helper/audio_helper/version-files
+--- xctools/audio_helper/version-files  2015-02-20 10:30:32.269561814 -0500
++++ xctools-audio-helper/audio_helper/version-files 2015-03-12 09:51:46.535246190 -0400
+@@ -1,3 +1,3 @@
+ src/version.c
+ src/project.h
+-src/audio_helper.c
++src/openxtaudio.c
