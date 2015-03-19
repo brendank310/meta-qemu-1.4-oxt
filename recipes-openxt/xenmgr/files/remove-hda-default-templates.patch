@@ -1,7 +1,7 @@
 diff --git a/templates/default/new-vm b/templates/default/new-vm
 index 03fdec9..1110865 100644
---- a/templates/default/new-vm
-+++ b/templates/default/new-vm
+--- a/../templates/default/new-vm
++++ b/../templates/default/new-vm
 @@ -24,7 +24,7 @@
      "hap": "true",
      "nx": "true",
@@ -13,8 +13,8 @@ index 03fdec9..1110865 100644
      "boot": "cd",
 diff --git a/templates/default/new-vm-windows8 b/templates/default/new-vm-windows8
 index 1222bf1..c4e3e49 100644
---- a/templates/default/new-vm-windows8
-+++ b/templates/default/new-vm-windows8
+--- a/../templates/default/new-vm-windows8
++++ b/../templates/default/new-vm-windows8
 @@ -25,7 +25,7 @@
      "hap": "true",
      "nx": "true",
