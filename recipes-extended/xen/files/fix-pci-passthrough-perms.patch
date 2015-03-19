@@ -1,0 +1,76 @@
+diff --git a/policy/modules/xen/stubdom.te b/policy/modules/xen/stubdom.te
+index 642d871..731d4bd 100644
+--- a/policy/modules/xen/stubdom.te
++++ b/policy/modules/xen/stubdom.te
+@@ -81,3 +81,6 @@ pirq_add_resource(stubdom_t)
+ pirq_bind_hvm(stubdom_t)
+ pirq_use_resource(stubdom_t)
+ domio_map_write_mmu(stubdom_t)
++device_add_resource(stubdom_t)
++device_bind_hvm(stubdom_t)
++device_remove_resource(stubdom_t)
+diff --git a/policy/modules/xen/xen.if b/policy/modules/xen/xen.if
+index 7495d46..22eec83 100644
+--- a/policy/modules/xen/xen.if
++++ b/policy/modules/xen/xen.if
+@@ -200,6 +200,60 @@ interface(`pirq_bind_hvm',`
+ ')
+ ########################################
+ ## <summary>
++##	Allow the specified type to add_irq to
++##	device resources.
++## </summary>
++## <param name="type">
++##	<summary>
++##	Type of the domain allowed access.
++##	</summary>
++## </param>
++#
++interface(`device_add_resource',`
++	gen_require(`
++		type device_t;
++	')
++
++	allow $1 device_t:resource add_irq;
++')
++########################################
++## <summary>
++##	Allow the specified type to remove_irq to
++##	device resources.
++## </summary>
++## <param name="type">
++##	<summary>
++##	Type of the domain allowed access.
++##	</summary>
++## </param>
++#
++interface(`device_remove_resource',`
++	gen_require(`
++		type device_t;
++	')
++
++	allow $1 device_t:resource remove_irq;
++')
++########################################
++## <summary>
++##	Allow the specified type to bind_irq to
++##	device hvm.
++## </summary>
++## <param name="type">
++##	<summary>
++##	Type of the domain allowed access.
++##	</summary>
++## </param>
++#
++interface(`device_bind_hvm',`
++	gen_require(`
++		type device_t;
++	')
++
++	allow $1 device_t:hvm bind_irq;
++')
++########################################
++## <summary>
+ ##	Allow the specified type to vector pirq_t
+ ##  events.
+ ## </summary>
