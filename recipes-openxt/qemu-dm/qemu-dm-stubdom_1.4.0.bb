@@ -1,6 +1,8 @@
 require qemu-dm.inc
 
+#only stubdom specific patches in here, common patches belong in qemu-dm.inc
 SRC_URI += " \
+            file://0024-Stubdom-support-for-ISO-media-changes-after-boot.patch;striplevel=1 \
             file://qemu-ifup-stubdom \
             "
 
